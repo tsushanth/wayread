@@ -1,0 +1,8 @@
+{
+  "name": "wayread",
+  "version": "0.1.0",
+  "description": "Commands for understanding, reviewing and shipping code: orient, trace a use case, review, harden, ship-check, runbook.",
+  "author": {
+    "name": "Sushanth"
+  }
+}

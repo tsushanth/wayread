@@ -1,0 +1,16 @@
+{
+  "name": "wayread-tools",
+  "owner": {
+    "name": "Sushanth"
+  },
+  "plugins": [
+    {
+      "name": "wayread",
+      "source": "./",
+      "description": "Commands for understanding, reviewing and shipping code."
+    }
+  ],
+  "metadata": {
+    "description": "Code-understanding and review commands for Claude Code."
+  }
+}
