@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { execFileSync } from 'node:child_process';
+import { scanRepo, isClean } from './unpushed-work.mjs';
 
 export const REPO_THRESHOLD = 0.8;
 
@@ -100,37 +101,110 @@ export function failFlag(session_id, message) {
   fs.renameSync(path.join(dir, `${session_id}.json.processing`), path.join(dir, `${session_id}.json.failed`));
 }
 
-// Scan only the commits about to be pushed (mirrors this project's own pre-push convention),
-// or the whole (cheap, fresh) history when there's no upstream yet. Throws with gitleaks's
-// own output on any finding or error; returns normally when clean.
-export function gitleaksCheck(repoRoot) {
-  let range = null;
+// Fails loudly (process exits non-zero) instead of hanging on a stalled network or a credential prompt —
+// this runs unattended, with nobody at a terminal to answer a prompt.
+const GIT_EXEC_SAFETY = { env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, timeout: 30000 };
+
+function assertSafeRelPath(relPath) {
+  if (typeof relPath !== 'string' || !relPath) throw new Error('relPath must be a non-empty relative path');
+  if (path.isAbsolute(relPath)) throw new Error(`relPath must be relative, not absolute: ${relPath}`);
+  const segments = relPath.split(/[\\/]/);
+  if (segments.includes('..')) throw new Error(`relPath must not traverse outside the repo: ${relPath}`);
+}
+
+function currentBranch(repoRoot) {
+  return execFileSync('git', ['-C', repoRoot, 'rev-parse', '--abbrev-ref', 'HEAD'], { encoding: 'utf8' }).trim();
+}
+
+// Prefers 'origin' (this project's convention); falls back to whatever single remote exists.
+function pickRemote(repoRoot) {
+  const remotes = execFileSync('git', ['-C', repoRoot, 'remote'], { encoding: 'utf8' }).trim().split('\n').filter(Boolean);
+  if (remotes.includes('origin')) return 'origin';
+  return remotes[0] || null;
+}
+
+function remoteRefExists(repoRoot, remote, branch) {
+  if (!remote || !branch) return false;
   try {
-    execFileSync('git', ['-C', repoRoot, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], { stdio: ['ignore', 'pipe', 'ignore'] });
-    range = '@{u}..HEAD';
+    execFileSync('git', ['-C', repoRoot, 'rev-parse', '--verify', `${remote}/${branch}`], { stdio: ['ignore', 'pipe', 'ignore'] });
+    return true;
   } catch {
-    range = null;
-  }
-  const args = ['git', `--log-opts=${range ?? ''}`, '--redact', '.'];
-  try {
-    execFileSync('gitleaks', args, { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-  } catch (error) {
-    const output = [error.stdout, error.stderr].filter(Boolean).join('\n');
-    throw new Error(`gitleaks detected potential secrets (or failed to run):\n${output || error.message}`);
+    return false;
   }
 }
 
-// Write a file, commit it, scan the commits about to be pushed, then push.
-// The secrets scan happens strictly before any push attempt; a push rejection
-// (non-fast-forward, network failure, etc.) is reported, never retried as a force-push.
-export function writeAndPublish({ repoRoot, relPath, content, commitMessage }) {
-  const fullPath = path.join(repoRoot, relPath);
-  fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-  fs.writeFileSync(fullPath, content);
+// Scans exactly the commits the subsequent push will send: `<remote>/<branch>..HEAD` when that
+// remote-tracking ref already resolves locally, or the whole (cheap, fresh) history when it
+// doesn't yet — the same branch/remote this function's caller is about to push to, not `@{u}`,
+// so the scanned range can never silently diverge from the pushed range. Throws with gitleaks's
+// own output (plus the offending commit SHA) on any finding or error; returns normally when clean.
+export function gitleaksCheck(repoRoot) {
+  const branch = currentBranch(repoRoot);
+  const remote = pickRemote(repoRoot);
+  const range = remoteRefExists(repoRoot, remote, branch) ? `${remote}/${branch}..HEAD` : null;
+  const args = ['git', `--log-opts=${range ?? ''}`, '--redact', '.'];
+  try {
+    execFileSync('gitleaks', args, { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...GIT_EXEC_SAFETY });
+  } catch (error) {
+    const output = [error.stdout, error.stderr].filter(Boolean).join('\n');
+    const sha = execFileSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    throw new Error(
+      `gitleaks detected potential secrets (or failed to run) on commit ${sha}:\n${output || error.message}\n\n` +
+      `Commit ${sha} is now sitting locally on this branch, unpushed. Remove it or amend it before anything can be ` +
+      `pushed from this branch again — do not rely on the global pre-push hook alone here, since it can skip ` +
+      `scanning a brand-new branch's very first push.`
+    );
+  }
+}
 
-  execFileSync('git', ['-C', repoRoot, 'add', relPath]);
-  execFileSync('git', ['-C', repoRoot, 'commit', '-q', '-m', commitMessage]);
-  const sha = execFileSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+// Write a file, commit it, scan exactly the commits about to be pushed, then push.
+// Order of operations, each a hard gate on the next:
+//   1. relPath is validated (no absolute paths, no `..` traversal).
+//   2. The target repo must already be clean (nothing else uncommitted/unpushed on it) — this
+//      tool only ever adds its own one commit, and never sweeps up or publishes anyone else's
+//      unrelated work sitting in the same repo.
+//   3. The file is written and committed, scoped to exactly that one file (`commit -- relPath`),
+//      so nothing else staged in the index gets swept into the commit.
+//   4. gitleaksCheck runs on the new commit — a leak throws, and writeAndPublish returns
+//      `{ ok: false, error }` *before any push is attempted*.
+//   5. Only then does `git push <remote> HEAD:<branch>` run, with an explicit refspec (never a
+//      bare `git push`, which can follow push.default/triangular-remote config into pushing a
+//      different ref than the one just scanned). A push rejection (non-fast-forward, network
+//      failure, credential prompt, timeout) is caught in its own try/catch and reported as
+//      `{ ok: false, error }` — never retried, never force-pushed.
+export function writeAndPublish({ repoRoot, relPath, content, commitMessage }) {
+  try {
+    assertSafeRelPath(relPath);
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+
+  let guard;
+  try {
+    guard = scanRepo(repoRoot, { fetch: false }); // no network call — a local safety gate, not a sync check
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+  if (!isClean(guard)) {
+    return {
+      ok: false,
+      error: `${repoRoot} has other unpushed/uncommitted work; refusing to commit onto it to avoid pushing ` +
+        `something unrelated — resolve that first (see /sush-unpushed-work)`,
+    };
+  }
+
+  const fullPath = path.join(repoRoot, relPath);
+  let sha;
+  try {
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+    fs.writeFileSync(fullPath, content);
+    execFileSync('git', ['-C', repoRoot, 'add', relPath]);
+    execFileSync('git', ['-C', repoRoot, 'commit', '-q', '-m', commitMessage, '--', relPath]);
+    sha = execFileSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  } catch (error) {
+    const output = [error.stdout?.toString?.(), error.stderr?.toString?.()].filter(Boolean).join('\n');
+    return { ok: false, error: output || error.message };
+  }
 
   try {
     gitleaksCheck(repoRoot);
@@ -139,7 +213,10 @@ export function writeAndPublish({ repoRoot, relPath, content, commitMessage }) {
   }
 
   try {
-    execFileSync('git', ['-C', repoRoot, 'push'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const branch = currentBranch(repoRoot);
+    const remote = pickRemote(repoRoot);
+    if (!remote) return { ok: false, error: `${repoRoot} has no git remote configured; commit ${sha} is local only` };
+    execFileSync('git', ['-C', repoRoot, 'push', remote, `HEAD:${branch}`], { stdio: ['ignore', 'pipe', 'pipe'], ...GIT_EXEC_SAFETY });
   } catch (error) {
     const output = [error.stdout?.toString?.(), error.stderr?.toString?.()].filter(Boolean).join('\n');
     return { ok: false, error: output || error.message };

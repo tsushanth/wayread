@@ -129,6 +129,13 @@ test('locate falls back to root for a transcript that never touched a repo', asy
   assert.deepEqual(await locate(file), { kind: 'root' });
 });
 
+// Points core.hooksPath at an empty, isolated dir so test output doesn't inherit this
+// machine's global pre-push hook noise (it would otherwise run gitleaks a second time itself).
+function disableHooks(dir) {
+  const hooksDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-nohooks-'));
+  execFileSync('git', ['config', 'core.hooksPath', hooksDir], { cwd: dir });
+}
+
 function initRepoWithBareRemote(root, name) {
   const bare = path.join(root, `${name}.git`);
   execFileSync('git', ['init', '-q', '--bare', bare]);
@@ -137,12 +144,28 @@ function initRepoWithBareRemote(root, name) {
   execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir });
   execFileSync('git', ['config', 'user.email', 't@example.test'], { cwd: dir });
   execFileSync('git', ['config', 'user.name', 'T'], { cwd: dir });
+  disableHooks(dir);
   fs.writeFileSync(path.join(dir, 'seed.txt'), 'seed\n');
   execFileSync('git', ['add', '.'], { cwd: dir });
   execFileSync('git', ['commit', '-q', '-m', 'seed'], { cwd: dir });
   execFileSync('git', ['remote', 'add', 'origin', bare], { cwd: dir });
   execFileSync('git', ['push', '-q', '-u', 'origin', 'main'], { cwd: dir });
   return dir;
+}
+
+// Brand-new repo: remote configured, but nothing ever committed or pushed yet — no `-u`,
+// no pre-push. Covers the review-flagged "first push of a fresh branch" case.
+function initFreshRepoWithUnpushedRemote(root, name) {
+  const bare = path.join(root, `${name}.git`);
+  execFileSync('git', ['init', '-q', '--bare', bare]);
+  const dir = path.join(root, name);
+  fs.mkdirSync(dir, { recursive: true });
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir });
+  execFileSync('git', ['config', 'user.email', 't@example.test'], { cwd: dir });
+  execFileSync('git', ['config', 'user.name', 'T'], { cwd: dir });
+  disableHooks(dir);
+  execFileSync('git', ['remote', 'add', 'origin', bare], { cwd: dir });
+  return { dir, bare };
 }
 
 test('gitleaksCheck passes on a clean repo and throws on an obvious secret', () => {
@@ -168,10 +191,82 @@ test('writeAndPublish writes, commits, scans, and pushes one new file', () => {
 test('writeAndPublish never pushes a commit that trips the secrets scan', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-publish-leak-'));
   const dir = initRepoWithBareRemote(root, 'repo');
+  const bare = path.join(root, 'repo.git');
   const result = writeAndPublish({ repoRoot: dir, relPath: 'docs/session-log/2026-10-26-leak.md', content: "key: AKIAABCDEFGHIJKLMNOP\n", commitMessage: 'session log: leak' });
   assert.equal(result.ok, false);
-  const log = execFileSync('git', ['log', '--oneline', 'origin/main'], { cwd: dir, encoding: 'utf8' });
-  assert.doesNotMatch(log, /session log: leak/); // local commit may exist, but it never reached the remote
+  assert.match(result.error, /gitleaks|secret|leak/i); // it's specifically a leak finding, not just any failure
+  const bareLog = execFileSync('git', ['--git-dir', bare, 'log', '--oneline', 'main'], { encoding: 'utf8' });
+  assert.doesNotMatch(bareLog, /session log: leak/); // local commit may exist, but it never reached the remote itself
+});
+
+test('writeAndPublish refuses to touch a repo that already has other unpushed commits sitting on it', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-publish-scoped-'));
+  const dir = initRepoWithBareRemote(root, 'repo');
+  // Someone else's real, committed-but-unpushed work already on this branch.
+  fs.writeFileSync(path.join(dir, 'someone-elses-wip.txt'), 'wip\n');
+  execFileSync('git', ['add', 'someone-elses-wip.txt'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'wip: not ready to push'], { cwd: dir });
+
+  const result = writeAndPublish({ repoRoot: dir, relPath: 'docs/session-log/2026-10-26-scoped.md', content: '# scoped\n', commitMessage: 'session log: scoped' });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /unpushed|uncommitted/i);
+  assert.equal(fs.existsSync(path.join(dir, 'docs/session-log/2026-10-26-scoped.md')), false); // never even wrote the file
+  const bareLog = execFileSync('git', ['--git-dir', path.join(root, 'repo.git'), 'log', '--oneline', 'main'], { encoding: 'utf8' });
+  assert.doesNotMatch(bareLog, /scoped/); // and the remote never saw any of it
+});
+
+test('writeAndPublish succeeds on a brand-new repo pushing its very first commit, with no upstream configured yet', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-publish-first-'));
+  const { dir, bare } = initFreshRepoWithUnpushedRemote(root, 'repo');
+  const result = writeAndPublish({ repoRoot: dir, relPath: 'docs/session-log/2026-10-26-first.md', content: '# first\n', commitMessage: 'session log: first' });
+  assert.equal(result.ok, true);
+  const bareLog = execFileSync('git', ['--git-dir', bare, 'log', '--oneline', 'main'], { encoding: 'utf8' });
+  assert.match(bareLog, /session log: first/);
+});
+
+test('writeAndPublish reports a push rejection without force-pushing, leaving the local commit and the remote intact', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-publish-reject-'));
+  const dir = initRepoWithBareRemote(root, 'repo');
+  const bare = path.join(root, 'repo.git');
+  // Plain git allows non-fast-forward updates to a bare repo by default (receive.denyNonFastForwards
+  // defaults to false) — real hosts (GitHub, etc.) reject them, so this mirrors that real protection
+  // rather than testing a push mechanic this tool would otherwise just silently clobber with.
+  execFileSync('git', ['--git-dir', bare, 'config', 'receive.denyNonFastForwards', 'true']);
+
+  // A second clone pushes ahead first, so the original clone's next push is a non-fast-forward.
+  // The bare repo's own HEAD symref still points at the never-created default branch (the
+  // fixture only ever created "main" via push -u, never touched the bare's HEAD), so a plain
+  // clone checks out an unrelated empty branch — explicitly track "main" instead.
+  const clone2 = path.join(root, 'repo2');
+  execFileSync('git', ['clone', '-q', bare, clone2]);
+  execFileSync('git', ['config', 'user.email', 't@example.test'], { cwd: clone2 });
+  execFileSync('git', ['config', 'user.name', 'T'], { cwd: clone2 });
+  execFileSync('git', ['checkout', '-B', 'main', 'origin/main'], { cwd: clone2 });
+  disableHooks(clone2);
+  fs.writeFileSync(path.join(clone2, 'other.txt'), 'other\n');
+  execFileSync('git', ['add', '.'], { cwd: clone2 });
+  execFileSync('git', ['commit', '-q', '-m', 'other change'], { cwd: clone2 });
+  execFileSync('git', ['push', '-q'], { cwd: clone2 });
+
+  const beforeLog = execFileSync('git', ['--git-dir', bare, 'log', '--oneline', 'main'], { encoding: 'utf8' });
+
+  const result = writeAndPublish({ repoRoot: dir, relPath: 'docs/session-log/2026-10-26-reject.md', content: '# reject\n', commitMessage: 'session log: reject' });
+  assert.equal(result.ok, false);
+
+  const localLog = execFileSync('git', ['log', '--oneline'], { cwd: dir, encoding: 'utf8' });
+  assert.match(localLog, /session log: reject/); // the local commit is still there — never reset or dropped
+
+  const afterLog = execFileSync('git', ['--git-dir', bare, 'log', '--oneline', 'main'], { encoding: 'utf8' });
+  assert.equal(afterLog, beforeLog); // the remote is byte-for-byte unchanged by the failed attempt
+});
+
+test('writeAndPublish rejects a relPath that escapes the repo root', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-publish-traversal-'));
+  const dir = initRepoWithBareRemote(root, 'repo');
+  const result = writeAndPublish({ repoRoot: dir, relPath: '../escape.md', content: 'x', commitMessage: 'escape' });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /relative|traverse/i);
+  assert.equal(fs.existsSync(path.join(root, 'escape.md')), false);
 });
 
 test('writeFallbackEntry writes a minimal, honest note when the transcript is gone', () => {
