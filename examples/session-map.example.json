@@ -1,0 +1,20 @@
+{
+  "title": "Booking App Decisions",
+  "sessions": [{ "id": "example-session", "file": "session.example.jsonl", "label": "Booking app, two days" }],
+  "note": "A small invented conversation, to show the format.",
+  "nodes": [
+    { "id": "r1", "route": true, "status": "decided", "title": "A database for the booking app", "src": "H1", "quote": "We need a database for the booking app", "note": "Team of two, one server." },
+    { "id": "r2", "parent": "r1", "route": true, "status": "decided", "constraint": true, "title": "Postgres", "src": "H2", "quote": "Go with Postgres", "note": "A worker writes alongside the web app." },
+    { "id": "firebase", "parent": "r2", "status": "rejected", "title": "Firebase", "src": "H3", "quote": "I do not want vendor lock-in", "note": "Hosted option offered in the first answer." },
+    { "id": "redis", "parent": "r2", "status": "unexplored", "title": "Redis cache layer", "src": "A3", "quote": "a cache layer such as Redis", "note": "Mentioned once, never picked up." },
+    { "id": "region", "parent": "r2", "status": "deferred", "title": "Multi-region failover", "src": "H4", "quote": "hold off on multi-region", "note": "Revisit with customers outside the US." },
+    { "id": "r3", "parent": "r2", "route": true, "status": "decided", "title": "Email magic links only", "src": "H5", "quote": "Email magic links only", "note": "Passwords are a support burden." },
+    { "id": "provider", "parent": "r3", "status": "open", "title": "Which email provider?", "src": "A5", "quote": "I have not picked one", "note": "Cheapest for 5,000 a month was asked and not compared." },
+    { "id": "r4", "parent": "r3", "route": true, "status": "decided", "title": "Booking table first", "src": "H7", "quote": "Build the booking table first" },
+    { "id": "lock", "parent": "r4", "status": "rejected", "title": "Row lock in app code", "src": "A8", "quote": "I tried a row lock in application code first; it still allowed a race", "note": "Dropped after the concurrency test." },
+    { "id": "r5", "parent": "r4", "route": true, "status": "decided", "title": "A database constraint stops double bookings", "src": "H8", "quote": "Fix it with a database constraint, not application code" },
+    { "id": "r6", "parent": "r5", "route": true, "status": "now", "title": "Email reminders", "src": "H11", "quote": "Email only for now" },
+    { "id": "sms", "parent": "r6", "status": "deferred", "title": "Text message reminders", "src": "H11", "quote": "Texts later maybe", "note": "Needs a separate provider and carrier registration." }
+  ],
+  "links": [{ "from": "r6", "to": "provider", "label": "reminders need it" }]
+}

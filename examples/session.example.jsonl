@@ -1,0 +1,26 @@
+{"type":"user","timestamp":"2026-03-02T17:00:00.000Z","message":{"role":"user","content":"We need a database for the booking app. Postgres or SQLite? We are a team of two."}}
+{"type":"assistant","timestamp":"2026-03-02T17:00:20.000Z","message":{"role":"assistant","content":[{"type":"text","text":"For two people and one server, SQLite is simplest. Postgres is the safer choice if you expect several app servers or heavy concurrent writes. A third option is a hosted database such as Firebase, which removes the ops work but ties you to one vendor."}]}}
+{"type":"user","timestamp":"2026-03-02T17:02:00.000Z","message":{"role":"user","content":"Go with Postgres. We will have a worker process writing at the same time as the web app."}}
+{"type":"assistant","timestamp":"2026-03-02T17:02:30.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Postgres it is. I'll set up a local container and a migration tool."}]}}
+{"type":"user","timestamp":"2026-03-02T17:04:00.000Z","message":{"role":"user","content":"Skip Firebase, I do not want vendor lock-in."}}
+{"type":"assistant","timestamp":"2026-03-02T17:04:20.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Understood, Firebase is off the table. Two things I have not decided for you: a cache layer such as Redis, and multi-region failover. I would hold off on both until there is real traffic."}]}}
+{"type":"user","timestamp":"2026-03-02T17:06:00.000Z","message":{"role":"user","content":"Agreed, hold off on multi-region. We can revisit when we have customers outside the US."}}
+{"type":"assistant","timestamp":"2026-03-02T17:06:20.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Parked: multi-region failover. Next, authentication. Options are email links, passwords, or a social login."}]}}
+{"type":"user","timestamp":"2026-03-02T17:09:00.000Z","message":{"role":"user","content":"Email magic links only. Passwords are a support burden."}}
+{"type":"assistant","timestamp":"2026-03-02T17:09:30.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Magic links. That needs an email provider; I have not picked one."}]}}
+{"type":"user","timestamp":"2026-03-02T17:12:00.000Z","message":{"role":"user","content":"Which email provider is cheapest for 5,000 emails a month?"}}
+{"type":"assistant","timestamp":"2026-03-02T17:12:40.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Prices change, so I would check current pricing before choosing. I have not compared them yet."}]}}
+{"type":"user","timestamp":"2026-03-02T17:20:00.000Z","message":{"role":"user","content":"Build the booking table first, then the availability check."}}
+{"type":"assistant","timestamp":"2026-03-02T17:21:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"npm test"}}]}}
+{"type":"user","timestamp":"2026-03-02T17:21:10.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"12 passed"}]}}
+{"type":"assistant","timestamp":"2026-03-02T17:21:30.000Z","isSidechain":true,"message":{"role":"assistant","content":[{"type":"text","text":"(a subagent's private reasoning, not part of the conversation)"}]}}
+{"type":"assistant","timestamp":"2026-03-02T17:22:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Booking table and migration are done and the tests pass. The availability check is next."}]}}
+{"type":"user","timestamp":"2026-03-02T17:40:00.000Z","message":{"role":"user","content":"The availability check is returning double bookings under load. Fix it with a database constraint, not application code."}}
+{"type":"assistant","timestamp":"2026-03-02T17:42:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"A database-level exclusion constraint fixed the double bookings in the concurrency test. I tried a row lock in application code first; it still allowed a race, so I dropped it."}]}}
+{"type":"system","timestamp":"2026-03-02T17:45:00.000Z","compactMetadata":{"trigger":"auto"}}
+{"type":"user","timestamp":"2026-03-03T16:00:00.000Z","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation. Bookings and the constraint are in place; email provider still open."}}
+{"type":"assistant","timestamp":"2026-03-03T16:00:20.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Picking up from the summary: bookings and the constraint are in place."}]}}
+{"type":"user","timestamp":"2026-03-03T16:02:00.000Z","message":{"role":"user","content":"Now add reminders. Text message or email?"}}
+{"type":"assistant","timestamp":"2026-03-03T16:02:30.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Email reminders can reuse the magic-link provider once chosen. Text messages need a separate provider and carrier registration, which takes weeks."}]}}
+{"type":"user","timestamp":"2026-03-03T16:05:00.000Z","message":{"role":"user","content":"Email only for now. Texts later maybe."}}
+{"type":"assistant","timestamp":"2026-03-03T16:05:20.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Email reminders only. Texts are parked."}]}}
