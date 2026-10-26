@@ -51,10 +51,23 @@ Use this when you have a specific requirement to implement.
 | `/wayread:explain-code-change` | Plain-language recap of whatever's currently uncommitted in the repo — faster than reading a raw diff. No argument for the whole working tree; add a file for a deep dive on just that file. |
 | `/wayread:change-full-review` | A single heavier one-shot: code review + unit tests + sanity/integration tests + a security review, all published as one combined artifact. Use when you want the full picture in one pass rather than running the individual pieces separately. |
 | `/wayread:trace` | Trace ONE use case through the code ("a caller asks for a person") and publish a walkthrough: numbered steps, sequence diagram, key code by function name, optional live proof (`live`), and what to say when someone asks to see it. Use when you need to show or explain how something works, including code AI wrote. |
+| `/wayread:product-map` | For a product built from several repos — which repos/components implement which capabilities, the cross-repo links no single repo shows, and whether each component is verified against what's actually deployed. `change <description>` mode routes you to which repos a change would touch, before planning it in depth. |
 | `/wayread:live-plan` | Shows a task's plan as a graph (steps, the files each touches, what waits on what) and compares it with what git says changed. Published as an Artifact and updated at each step boundary. Needs Node 18+. Runs automatically inside `/wayread:new-feature-cycle` and `/wayread:refactor-cycle`. |
 | `/wayread:session-map` | Reads a long Claude Code conversation and draws a route map of its decisions: green for decided, red for ruled out, amber for parked, a dotted ring for options nobody picked up, purple for open questions. Every node has a quote that is checked against the transcript. `update` adds what happened since; `resume` restarts the missed threads in parallel, after you confirm. The page can also copy a restart brief for any thread. Needs Node 18+. |
+| `/wayread:session-log-catchup` | Writes the close-out summaries for Claude Code sessions that ended without one — three short paragraphs (where we started, where we ended, what is left) per pending session, committed to the product repo's `docs/session-log/` or the cross-project `session-logs` folder. Runs on its own after a session starts (once a `SessionStart` hook is configured in your personal settings), or by hand. Needs Node 18+. |
 | `/wayread:unpushed-work` | Finds git work that exists only on this machine — branches ahead of their remote, stash entries, commits orphaned by a reset or a dropped stash — in one repo or swept across every repo under a folder. Never pushes anything itself; reports and asks. `catch-up`, `ship-check`, `fix-repo-cycle`, `new-feature-cycle` and `refactor-cycle` already run a quick version of it at the end of their own flow. Needs Node 18+. |
 | `/wayread:runbook` | The entry point when you're not sure which command fits — maps an intent (new feature, fix bugs, orient, ship-readiness, refactor, catch up) to the right command, and can run it for you after confirming. |
+
+## Periodic diagnostics (no fixed sequence — run standalone, any time)
+
+Not tied to a specific change or release moment — these answer "is this system actually healthy/visible/understood right now," any time someone wants to know.
+
+| Command | When to use |
+|---|---|
+| `/wayread:code-health` | Whole-system structural sweep: test coverage reality, release pipeline, promotion gates, monitoring/downtime risk, and a catch-all fifth dimension — all checked against what's actually deployed, not just the default branch. Diagnostic only. |
+| `/wayread:prod-audit` | Read-only security audit for the class of vulnerability code review alone misses — unauthenticated live endpoints, secrets with fallback defaults, policy drift between migrations and the applied database, stale docs vs. actual deployed state. |
+| `/wayread:usage-audit` | Audits product usage *visibility* — whether the data to answer a basic product question (who's using what, how much) actually exists and can be trusted — then recommends concrete instrumentation to add. |
+| `/wayread:behavior-audit` | Builds on `/wayread:usage-audit`: turns real (however small) usage numbers into specific, evidence-cited product recommendations — activation funnel, first-run friction, feature adoption, end-user behavior. Requires `usage-audit` to have found real data first. |
 
 ## Quick decision
 
@@ -69,4 +82,10 @@ Use this when you have a specific requirement to implement.
 - **"I just want to understand this codebase, not change it."** → `/wayread:orient`
 - **"Can this ship?"** → `/wayread:ship-check`
 - **"I'm restructuring this without changing behavior."** → `/wayread:refactor-cycle "X"`
+- **"This product spans several repos — what lives where?"** → `/wayread:product-map`
+- **"Is this system/release process actually healthy right now?"** → `/wayread:code-health`
+- **"Is there a security gap only visible in production?"** → `/wayread:prod-audit`
+- **"Do we even know how this product is being used?"** → `/wayread:usage-audit`
+- **"We have real usage data — what should we change?"** → `/wayread:behavior-audit`
+- **"Write up the close-out notes for sessions that ended without one."** → `/wayread:session-log-catchup`
 - **"Not sure which of the above I want."** → `/wayread:runbook`

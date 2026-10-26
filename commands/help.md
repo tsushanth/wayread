@@ -9,7 +9,8 @@ Group the output the same way the plugin's `COMMANDS.md` groups it (read that fi
 1. **Flow 1 — auditing and fixing an existing codebase**: system-overview, intent, blindspots, harden, fix-repo-cycle
 2. **Flow 2 — building a new feature**: system-overview, explain-approach, code-review, coverage, guardrails, new-feature-cycle
 3. **Other wrapped intents**: orient, catch-up, ship-check, refactor-cycle
-4. **Standalone utilities**: explain-code-change, change-full-review, trace, live-plan, session-map, unpushed-work, runbook
+4. **Standalone utilities**: explain-code-change, change-full-review, trace, product-map, live-plan, session-map, session-log-catchup, unpushed-work, runbook
+5. **Periodic diagnostics**: code-health, prod-audit, usage-audit, behavior-audit
 
 For each command, print: the command name, its actual current one-line description, and if the description doesn't already make it obvious, a short "use this when..." clause.
 
