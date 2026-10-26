@@ -11,6 +11,7 @@ Commands are namespaced `/wayread:<name>`. Run `/wayread:help` for the list, or 
 | Understand a codebase | `/wayread:system-overview`, `/wayread:intent`, `/wayread:orient` |
 | Explain how one use case works end to end | `/wayread:trace "user resets their password"` (add `live` for a safe test-environment proof, `save` for a Markdown copy) |
 | Map a product across several repos | `/wayread:product-map` (capability → repos/files, cross-repo links, verified against what's deployed; `change <description>` routes a planned change to the right repos) |
+| Get a file-by-file reference of a codebase | `/wayread:file-index` (one line per file, grouped by directory — lighter than `system-overview`'s architecture view; scope to a subdirectory on a large monorepo) |
 | Find and fix problems | `/wayread:blindspots`, `/wayread:harden`, `/wayread:fix-repo-cycle` |
 | Build or refactor with review gates | `/wayread:explain-approach`, `/wayread:new-feature-cycle`, `/wayread:refactor-cycle` |
 | See where a long conversation went, and restart what fell off | `/wayread:session-map latest` (a route map of the decisions, with branches for what was ruled out, parked, never pursued or left open; every node has a checked quote; copy a restart brief for any thread) |
