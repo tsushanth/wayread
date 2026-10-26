@@ -50,6 +50,7 @@ One folder per session: the session scratchpad directory if the system prompt na
 - It does not retry failures. A failed flag stays in the pending folder as `.failed` until someone looks at `errors.log` and decides.
 - It does not read tool output or file contents beyond the conversation transcript the digest produces.
 - It does not push to anything except the git remote of the repo `publish` writes to.
+- It does not recover a flag stuck as `.processing` after a claim that never finished publishing or falling back (for example, the session crashed mid-catch-up). That file has to be found and deleted by hand under `~/.claude/session-map-pending/` (or `$CLAUDE_CONFIG_DIR/session-map-pending/` if that variable is set).
 
 ## When to use this
 
