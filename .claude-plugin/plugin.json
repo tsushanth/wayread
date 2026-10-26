@@ -1,7 +1,7 @@
 {
   "name": "wayread",
-  "version": "0.5.0",
-  "description": "Commands for understanding, reviewing and shipping code: orient, trace a use case, review, harden, ship-check, a live plan graph, a decision map of long conversations, an unpushed-work audit, session-close summary tracking and catch-up, runbook.",
+  "version": "0.6.0",
+  "description": "Commands for understanding, reviewing and shipping code: orient, trace a use case, review, harden, ship-check, a live plan graph, a decision map of long conversations, an unpushed-work audit, session-close summary tracking and catch-up, a multi-repo product map, periodic code-health/security/usage/behavior audits, runbook.",
   "author": {
     "name": "Sushanth"
   }
