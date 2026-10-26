@@ -377,30 +377,30 @@ Claude, running inside the catch-up command, has no way to import a JS function 
 
 **Interfaces:**
 - Consumes: every exported function from Tasks 1–4.
-- Produces: a `main(argv)` CLI, structured like `session-map.mjs`'s own `main`, with subcommands `flag`, `pending`, `claim`, `publish`, `fallback`, `--help`; invoked when run directly (same `fileURLToPath(import.meta.url)` guard `session-map.mjs` already uses). `export function destinationFor(flag: { session_id, transcript_path, ts }): { repoRoot: string, relPath: string }` — calls `locate(flag.transcript_path)`; for `{ kind: 'repo', repoPath }` returns `{ repoRoot: repoPath, relPath: `docs/session-log/${date}-${shortId}.md` }`; for `{ kind: 'root' }`, ensures `~/Documents/GitHub/session-logs` exists as a git repo (running the same `git init` + README-commit sequence Task 7 Step 1 uses, but only when the directory is missing — idempotent) and returns `{ repoRoot: '~/Documents/GitHub/session-logs' (expanded), relPath: `${date}/${shortId}.md` }`. `date` is `new Date(flag.ts).toISOString().slice(0, 10)`; `shortId` is `flag.session_id.slice(0, 8)`.
+- Produces: a `main(argv)` CLI, structured like `session-map.mjs`'s own `main`, with subcommands `flag`, `pending`, `claim`, `publish`, `fallback`, `--help`; invoked when run directly (same `fileURLToPath(import.meta.url)` guard `session-map.mjs` already uses). `export async function destinationFor(flag: { session_id, transcript_path, ts }): Promise<{ repoRoot: string, relPath: string }>` — **async, because it awaits `locate`** (Task 3's `locate` is itself `async`, since it awaits `scanCwds`'s file read; every caller of `destinationFor`, including the CLI's `publish`/`fallback` handlers, must `await` it). Calls `await locate(flag.transcript_path)`; for `{ kind: 'repo', repoPath }` returns `{ repoRoot: repoPath, relPath: `docs/session-log/${date}-${shortId}.md` }`; for `{ kind: 'root' }`, ensures `~/Documents/GitHub/session-logs` exists as a git repo (running the same `git init` + README-commit sequence Task 7 Step 1 uses, but only when the directory is missing — idempotent) and returns `{ repoRoot: '~/Documents/GitHub/session-logs' (expanded), relPath: `${date}/${shortId}.md` }`. `date` is `new Date(flag.ts).toISOString().slice(0, 10)`; `shortId` is `flag.session_id.slice(0, 8)`.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```js
-test('destinationFor a repo-centered session uses the product repo and docs/session-log/', () => {
+test('destinationFor a repo-centered session uses the product repo and docs/session-log/', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-dest-'));
   execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir });
   const real = fs.realpathSync(dir);
   // destinationFor calls locate(), which reads the transcript at flag.transcript_path — build one that's 100% this repo.
   const file = path.join(dir, 't.jsonl');
   fs.writeFileSync(file, Array.from({ length: 5 }, () => JSON.stringify({ type: 'user', cwd: real, timestamp: new Date().toISOString() })).join('\n'));
-  const dest = destinationFor({ session_id: 'abcdefgh1234', transcript_path: file, ts: Date.parse('2026-10-26T00:00:00Z') });
+  const dest = await destinationFor({ session_id: 'abcdefgh1234', transcript_path: file, ts: Date.parse('2026-10-26T00:00:00Z') });
   assert.equal(dest.repoRoot, real);
   assert.equal(dest.relPath, 'docs/session-log/2026-10-26-abcdefgh.md');
 });
 
-test('destinationFor a cross-cutting session creates and uses the session-logs root, dated', () => {
+test('destinationFor a cross-cutting session creates and uses the session-logs root, dated', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-home-'));
   process.env.HOME = home; // destinationFor must resolve ~/Documents/GitHub/session-logs against this
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-dest-root-'));
   const file = path.join(dir, 't.jsonl');
   fs.writeFileSync(file, JSON.stringify({ type: 'user', cwd: '/scratch', timestamp: new Date().toISOString() }));
-  const dest = destinationFor({ session_id: 'xyz99999aaaa', transcript_path: file, ts: Date.parse('2026-10-27T00:00:00Z') });
+  const dest = await destinationFor({ session_id: 'xyz99999aaaa', transcript_path: file, ts: Date.parse('2026-10-27T00:00:00Z') });
   assert.equal(dest.repoRoot, path.join(home, 'Documents/GitHub/session-logs'));
   assert.equal(dest.relPath, '2026-10-27/xyz99999.md');
   assert.equal(fs.existsSync(path.join(dest.repoRoot, '.git')), true); // created on demand
@@ -452,7 +452,7 @@ Expected: FAIL — `destinationFor` and the CLI don't exist yet; Tasks 1–4's t
 
 - [ ] **Step 3: Implement `destinationFor`, `main(argv)`, and the run-if-main guard**
 
-`destinationFor` matches its Interfaces description exactly. `flag` reads all of stdin (`fs.readFileSync(0, 'utf8')` or accumulate on `process.stdin`), `JSON.parse`s it, and calls `writeFlag` with its `session_id`/`transcript_path`/`cwd`/`reason` plus `ts: Date.now()`; on any error (bad JSON, missing `session_id`), append to `errors.log` directly (`pendingDir()` may not exist yet — create it) and exit non-zero rather than throwing an uncaught exception that a hook's timeout would otherwise mask. `pending` calls `listPending()`; with `--json` prints `JSON.stringify(result)`, otherwise a one-line human summary (`N session(s) pending a summary`). `claim <id>` calls `claimFlag` and prints its JSON (or exits 1 if `null`). `publish <id> --content-file <path>` reads the already-claimed flag's own JSON straight from `<pendingDir>/<id>.json.processing` (not re-claiming — `claim` must have run first), calls `destinationFor` on it, reads the markdown from `--content-file` (or stdin if the value is `-`), calls `writeAndPublish({ repoRoot, relPath, content, commitMessage: `session log: ${id.slice(0,8)}` })`, then `clearFlag(id)` on `{ ok: true }` or `failFlag(id, error)` on `{ ok: false }`. `fallback <id>` does the same `destinationFor` + clear/fail dance but calls `writeFallbackEntry` instead, using the claimed flag's own `session_id`/`ts` for `sessionId`/`endedAt`. `--help` prints a short synopsis of all five subcommands (mirror `session-map.mjs`'s `--help`, which prints its own leading `//` comment block).
+`destinationFor` matches its Interfaces description exactly. `flag` reads all of stdin (`fs.readFileSync(0, 'utf8')` or accumulate on `process.stdin`), `JSON.parse`s it, and calls `writeFlag` with its `session_id`/`transcript_path`/`cwd`/`reason` plus `ts: Date.now()`; on any error (bad JSON, missing `session_id`), append to `errors.log` directly (`pendingDir()` may not exist yet — create it) and exit non-zero rather than throwing an uncaught exception that a hook's timeout would otherwise mask. `pending` calls `listPending()`; with `--json` prints `JSON.stringify(result)`, otherwise a one-line human summary (`N session(s) pending a summary`). `claim <id>` calls `claimFlag` and prints its JSON (or exits 1 if `null`). `publish <id> --content-file <path>` reads the already-claimed flag's own JSON straight from `<pendingDir>/<id>.json.processing` (not re-claiming — `claim` must have run first), `await destinationFor(flag)` on it (both `main` and every handler that reaches `destinationFor` must be `async` — `main` already is, matching `session-map.mjs`'s own `async function main`), reads the markdown from `--content-file` (or stdin if the value is `-`), calls `writeAndPublish({ repoRoot, relPath, content, commitMessage: `session log: ${id.slice(0,8)}` })`, then `clearFlag(id)` on `{ ok: true }` or `failFlag(id, error)` on `{ ok: false }`. `fallback <id>` does the same `await destinationFor(...)` + clear/fail dance but calls `writeFallbackEntry` instead, using the claimed flag's own `session_id`/`ts` for `sessionId`/`endedAt`. `--help` prints a short synopsis of all five subcommands (mirror `session-map.mjs`'s `--help`, which prints its own leading `//` comment block).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
