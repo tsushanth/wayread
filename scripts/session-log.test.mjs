@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
-import { scanCwds, decideLocation, resolveRepoRoot, REPO_THRESHOLD, writeFlag, listPending, claimFlag, clearFlag, failFlag, locate } from './session-log.mjs';
+import { scanCwds, decideLocation, resolveRepoRoot, REPO_THRESHOLD, writeFlag, listPending, claimFlag, clearFlag, failFlag, locate, gitleaksCheck, writeAndPublish, writeFallbackEntry } from './session-log.mjs';
 
 function writeJsonl(file, cwds) {
   fs.writeFileSync(file, cwds.map((cwd) => JSON.stringify({ type: 'user', cwd, timestamp: new Date().toISOString() })).join('\n') + '\n');
@@ -127,4 +127,59 @@ test('locate falls back to root for a transcript that never touched a repo', asy
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-locate-'));
   const file = makeTranscript(dir, ['/tmp/scratch', '/tmp/scratch']);
   assert.deepEqual(await locate(file), { kind: 'root' });
+});
+
+function initRepoWithBareRemote(root, name) {
+  const bare = path.join(root, `${name}.git`);
+  execFileSync('git', ['init', '-q', '--bare', bare]);
+  const dir = path.join(root, name);
+  fs.mkdirSync(dir, { recursive: true });
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir });
+  execFileSync('git', ['config', 'user.email', 't@example.test'], { cwd: dir });
+  execFileSync('git', ['config', 'user.name', 'T'], { cwd: dir });
+  fs.writeFileSync(path.join(dir, 'seed.txt'), 'seed\n');
+  execFileSync('git', ['add', '.'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'seed'], { cwd: dir });
+  execFileSync('git', ['remote', 'add', 'origin', bare], { cwd: dir });
+  execFileSync('git', ['push', '-q', '-u', 'origin', 'main'], { cwd: dir });
+  return dir;
+}
+
+test('gitleaksCheck passes on a clean repo and throws on an obvious secret', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-leaks-'));
+  const dir = initRepoWithBareRemote(root, 'clean');
+  assert.doesNotThrow(() => gitleaksCheck(dir));
+  fs.writeFileSync(path.join(dir, 'oops.env'), "AWS_SECRET_ACCESS_KEY=AKIAABCDEFGHIJKLMNOP\n");
+  execFileSync('git', ['add', '.'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'leak'], { cwd: dir });
+  assert.throws(() => gitleaksCheck(dir));
+});
+
+test('writeAndPublish writes, commits, scans, and pushes one new file', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-publish-'));
+  const dir = initRepoWithBareRemote(root, 'repo');
+  const result = writeAndPublish({ repoRoot: dir, relPath: 'docs/session-log/2026-10-26-test.md', content: '# test\n', commitMessage: 'session log: test' });
+  assert.equal(result.ok, true);
+  assert.equal(fs.existsSync(path.join(dir, 'docs/session-log/2026-10-26-test.md')), true);
+  const log = execFileSync('git', ['log', '--oneline', 'origin/main'], { cwd: dir, encoding: 'utf8' });
+  assert.match(log, /session log: test/); // confirms it actually reached the remote, not just a local commit
+});
+
+test('writeAndPublish never pushes a commit that trips the secrets scan', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-publish-leak-'));
+  const dir = initRepoWithBareRemote(root, 'repo');
+  const result = writeAndPublish({ repoRoot: dir, relPath: 'docs/session-log/2026-10-26-leak.md', content: "key: AKIAABCDEFGHIJKLMNOP\n", commitMessage: 'session log: leak' });
+  assert.equal(result.ok, false);
+  const log = execFileSync('git', ['log', '--oneline', 'origin/main'], { cwd: dir, encoding: 'utf8' });
+  assert.doesNotMatch(log, /session log: leak/); // local commit may exist, but it never reached the remote
+});
+
+test('writeFallbackEntry writes a minimal, honest note when the transcript is gone', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-fallback-'));
+  const dir = initRepoWithBareRemote(root, 'repo');
+  const result = writeFallbackEntry({ repoRoot: dir, relPath: 'docs/session-log/2026-10-26-gone.md', sessionId: 'abc123', endedAt: '2026-10-26' });
+  assert.equal(result.ok, true);
+  const text = fs.readFileSync(path.join(dir, 'docs/session-log/2026-10-26-gone.md'), 'utf8');
+  assert.match(text, /abc123/);
+  assert.match(text, /no longer available/);
 });

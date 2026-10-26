@@ -99,3 +99,58 @@ export function failFlag(session_id, message) {
   fs.appendFileSync(path.join(dir, 'errors.log'), `${new Date().toISOString()} ${session_id} ${message}\n`);
   fs.renameSync(path.join(dir, `${session_id}.json.processing`), path.join(dir, `${session_id}.json.failed`));
 }
+
+// Scan only the commits about to be pushed (mirrors this project's own pre-push convention),
+// or the whole (cheap, fresh) history when there's no upstream yet. Throws with gitleaks's
+// own output on any finding or error; returns normally when clean.
+export function gitleaksCheck(repoRoot) {
+  let range = null;
+  try {
+    execFileSync('git', ['-C', repoRoot, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    range = '@{u}..HEAD';
+  } catch {
+    range = null;
+  }
+  const args = ['git', `--log-opts=${range ?? ''}`, '--redact', '.'];
+  try {
+    execFileSync('gitleaks', args, { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (error) {
+    const output = [error.stdout, error.stderr].filter(Boolean).join('\n');
+    throw new Error(`gitleaks detected potential secrets (or failed to run):\n${output || error.message}`);
+  }
+}
+
+// Write a file, commit it, scan the commits about to be pushed, then push.
+// The secrets scan happens strictly before any push attempt; a push rejection
+// (non-fast-forward, network failure, etc.) is reported, never retried as a force-push.
+export function writeAndPublish({ repoRoot, relPath, content, commitMessage }) {
+  const fullPath = path.join(repoRoot, relPath);
+  fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+  fs.writeFileSync(fullPath, content);
+
+  execFileSync('git', ['-C', repoRoot, 'add', relPath]);
+  execFileSync('git', ['-C', repoRoot, 'commit', '-q', '-m', commitMessage]);
+  const sha = execFileSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+
+  try {
+    gitleaksCheck(repoRoot);
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+
+  try {
+    execFileSync('git', ['-C', repoRoot, 'push'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (error) {
+    const output = [error.stdout?.toString?.(), error.stderr?.toString?.()].filter(Boolean).join('\n');
+    return { ok: false, error: output || error.message };
+  }
+
+  return { ok: true, path: fullPath, sha };
+}
+
+// Builds the "transcript was no longer available" markdown — the one piece of prose this
+// script writes itself, since there's no transcript left to ask Claude about — and publishes it.
+export function writeFallbackEntry({ repoRoot, relPath, sessionId, endedAt }) {
+  const content = `# Session ${sessionId}\n\n${sessionId} ended on ${endedAt}; its transcript was no longer available to summarize.\n`;
+  return writeAndPublish({ repoRoot, relPath, content, commitMessage: `session log: ${sessionId} (fallback)` });
+}
