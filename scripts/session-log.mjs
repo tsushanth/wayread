@@ -1,8 +1,19 @@
+// session-log: flag a session for a close-out summary, then write that summary to its repo (or
+// the cross-project session-logs root) and push it. No dependencies. Needs Node 18+.
+//
+//   node session-log.mjs flag                                  (reads hook JSON from stdin, writes a pending flag)
+//   node session-log.mjs pending [--json]                       (list sessions pending a summary)
+//   node session-log.mjs claim <session_id>                     (claim one pending flag, prints its JSON)
+//   node session-log.mjs publish <session_id> --content-file <path|->   (write/commit/push the summary, clear the flag)
+//   node session-log.mjs fallback <session_id>                  (write a minimal fallback note when no transcript was available)
+//
+// `claim` must run before `publish`/`fallback` — they read the already-claimed `.processing` file, never re-claim.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 export const REPO_THRESHOLD = 0.8;
 
@@ -259,4 +270,128 @@ export function writeAndPublish({ repoRoot, relPath, content, commitMessage }) {
 export function writeFallbackEntry({ repoRoot, relPath, sessionId, endedAt }) {
   const content = `# Session ${sessionId}\n\n${sessionId} ended on ${endedAt}; its transcript was no longer available to summarize.\n`;
   return writeAndPublish({ repoRoot, relPath, content, commitMessage: `session log: ${sessionId} (fallback)` });
+}
+
+// The cross-cutting-session repo, created on first use. Same git init + README-commit sequence
+// as Task 7 Step 1's manual setup, so either one happening first is harmless.
+function ensureSessionLogsRoot() {
+  const root = path.join(os.homedir(), 'Documents/GitHub/session-logs');
+  if (fs.existsSync(root)) return root;
+  fs.mkdirSync(root, { recursive: true });
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: root });
+  fs.writeFileSync(
+    path.join(root, 'README.md'),
+    '# session-logs\n\nSession-close summaries written automatically by wayread\'s session-log tooling. One file per session, organized by date.\n'
+  );
+  execFileSync('git', ['add', 'README.md'], { cwd: root });
+  execFileSync('git', ['commit', '-q', '-m', 'init: session-logs'], { cwd: root });
+  return root;
+}
+
+// Where a claimed flag's summary should be written: alongside the repo it was mostly about,
+// or in the cross-project session-logs root, created on demand.
+export async function destinationFor(flag) {
+  const date = new Date(flag.ts).toISOString().slice(0, 10);
+  const shortId = flag.session_id.slice(0, 8);
+  const decision = await locate(flag.transcript_path);
+  if (decision.kind === 'repo') {
+    return { repoRoot: decision.repoPath, relPath: `docs/session-log/${date}-${shortId}.md` };
+  }
+  return { repoRoot: ensureSessionLogsRoot(), relPath: `${date}/${shortId}.md` };
+}
+
+// ---------- CLI ----------
+
+function cliFlag(args, name, def) { const i = args.indexOf(name); if (i < 0) return def; const v = args[i + 1]; args.splice(i, 2); return v; }
+
+function readStdin() {
+  return fs.readFileSync(0, 'utf8');
+}
+
+async function main(argv) {
+  const [cmd, ...rest] = argv;
+  const usage = () => {
+    const lines = fs.readFileSync(fileURLToPath(import.meta.url), 'utf8').split('\n');
+    const header = [];
+    for (const l of lines) {
+      if (!l.startsWith('//')) break;
+      header.push(l.slice(3));
+    }
+    return header.join('\n');
+  };
+  if (!cmd) {
+    console.error(usage());
+    return 2;
+  }
+  if (cmd === '--help' || cmd === '-h') {
+    console.log(usage());
+    return 0;
+  }
+
+  if (cmd === 'flag') {
+    let data;
+    try {
+      const raw = JSON.parse(readStdin());
+      if (!raw || typeof raw.session_id !== 'string' || !raw.session_id) throw new Error('missing session_id');
+      data = { session_id: raw.session_id, transcript_path: raw.transcript_path, cwd: raw.cwd, reason: raw.reason, ts: Date.now() };
+      writeFlag(data);
+    } catch (error) {
+      fs.mkdirSync(pendingDir(), { recursive: true });
+      fs.appendFileSync(path.join(pendingDir(), 'errors.log'), `${new Date().toISOString()} flag: ${error.message}\n`);
+      return 1;
+    }
+    return 0;
+  }
+
+  if (cmd === 'pending') {
+    const asJson = rest.includes('--json');
+    const result = listPending();
+    console.log(asJson ? JSON.stringify(result) : `${result.length} session(s) pending a summary`);
+    return 0;
+  }
+
+  if (cmd === 'claim') {
+    const [id] = rest;
+    if (!id) throw new Error('usage: claim <session_id>');
+    const claimed = claimFlag(id);
+    if (!claimed) return 1;
+    console.log(JSON.stringify(claimed));
+    return 0;
+  }
+
+  if (cmd === 'publish') {
+    const [id] = rest;
+    const contentFileArg = cliFlag(rest, '--content-file');
+    if (!id || !contentFileArg) throw new Error('usage: publish <session_id> --content-file <path>');
+    const processingPath = path.join(pendingDir(), `${id}.json.processing`);
+    if (!fs.existsSync(processingPath)) throw new Error(`${id} is not claimed; run claim first`);
+    const flagData = JSON.parse(fs.readFileSync(processingPath, 'utf8'));
+    const { repoRoot, relPath } = await destinationFor(flagData);
+    const content = contentFileArg === '-' ? readStdin() : fs.readFileSync(contentFileArg, 'utf8');
+    const result = writeAndPublish({ repoRoot, relPath, content, commitMessage: `session log: ${id.slice(0, 8)}` });
+    if (result.ok) { clearFlag(id); return 0; }
+    failFlag(id, result.error);
+    console.error(`publish failed for ${id}: ${result.error}`);
+    return 1;
+  }
+
+  if (cmd === 'fallback') {
+    const [id] = rest;
+    if (!id) throw new Error('usage: fallback <session_id>');
+    const processingPath = path.join(pendingDir(), `${id}.json.processing`);
+    if (!fs.existsSync(processingPath)) throw new Error(`${id} is not claimed; run claim first`);
+    const flagData = JSON.parse(fs.readFileSync(processingPath, 'utf8'));
+    const { repoRoot, relPath } = await destinationFor(flagData);
+    const result = writeFallbackEntry({ repoRoot, relPath, sessionId: flagData.session_id, endedAt: new Date(flagData.ts).toISOString() });
+    if (result.ok) { clearFlag(id); return 0; }
+    failFlag(id, result.error);
+    console.error(`fallback failed for ${id}: ${result.error}`);
+    return 1;
+  }
+
+  throw new Error(`unknown command ${JSON.stringify(cmd)}`);
+}
+
+if (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
+  main(process.argv.slice(2)).then((c) => { process.exitCode = c; }, (e) => { console.error(`session-log: ${e.message}`); process.exitCode = 2; });
 }

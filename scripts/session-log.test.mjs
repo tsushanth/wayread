@@ -4,7 +4,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
-import { scanCwds, decideLocation, resolveRepoRoot, REPO_THRESHOLD, writeFlag, listPending, claimFlag, clearFlag, failFlag, locate, gitleaksCheck, writeAndPublish, writeFallbackEntry } from './session-log.mjs';
+import { fileURLToPath } from 'node:url';
+import { scanCwds, decideLocation, resolveRepoRoot, REPO_THRESHOLD, writeFlag, listPending, claimFlag, clearFlag, failFlag, locate, gitleaksCheck, writeAndPublish, writeFallbackEntry, destinationFor } from './session-log.mjs';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const SCRIPT = path.join(here, 'session-log.mjs');
 
 function writeJsonl(file, cwds) {
   fs.writeFileSync(file, cwds.map((cwd) => JSON.stringify({ type: 'user', cwd, timestamp: new Date().toISOString() })).join('\n') + '\n');
@@ -305,4 +309,64 @@ test('writeFallbackEntry writes a minimal, honest note when the transcript is go
   const text = fs.readFileSync(path.join(dir, 'docs/session-log/2026-10-26-gone.md'), 'utf8');
   assert.match(text, /abc123/);
   assert.match(text, /no longer available/);
+});
+
+test('destinationFor a repo-centered session uses the product repo and docs/session-log/', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-dest-'));
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir });
+  const real = fs.realpathSync(dir);
+  // destinationFor calls locate(), which reads the transcript at flag.transcript_path — build one that's 100% this repo.
+  const file = path.join(dir, 't.jsonl');
+  fs.writeFileSync(file, Array.from({ length: 5 }, () => JSON.stringify({ type: 'user', cwd: real, timestamp: new Date().toISOString() })).join('\n'));
+  const dest = await destinationFor({ session_id: 'abcdefgh1234', transcript_path: file, ts: Date.parse('2026-10-26T00:00:00Z') });
+  assert.equal(dest.repoRoot, real);
+  assert.equal(dest.relPath, 'docs/session-log/2026-10-26-abcdefgh.md');
+});
+
+test('destinationFor a cross-cutting session creates and uses the session-logs root, dated', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-home-'));
+  process.env.HOME = home; // destinationFor must resolve ~/Documents/GitHub/session-logs against this
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-dest-root-'));
+  const file = path.join(dir, 't.jsonl');
+  fs.writeFileSync(file, JSON.stringify({ type: 'user', cwd: '/scratch', timestamp: new Date().toISOString() }));
+  const dest = await destinationFor({ session_id: 'xyz99999aaaa', transcript_path: file, ts: Date.parse('2026-10-27T00:00:00Z') });
+  assert.equal(dest.repoRoot, path.join(home, 'Documents/GitHub/session-logs'));
+  assert.equal(dest.relPath, '2026-10-27/xyz99999.md');
+  assert.equal(fs.existsSync(path.join(dest.repoRoot, '.git')), true); // created on demand
+});
+
+test('CLI: flag reads hook stdin JSON and writes a pending flag; pending lists it; claim removes it', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-cli-'));
+  const stdin = JSON.stringify({ session_id: 'cli1', transcript_path: '/t.jsonl', cwd: '/x', reason: 'other' });
+  execFileSync('node', [SCRIPT, 'flag'], { input: stdin, encoding: 'utf8', env: { ...process.env, CLAUDE_CONFIG_DIR: dir } });
+  const pendingOut = execFileSync('node', [SCRIPT, 'pending', '--json'], { encoding: 'utf8', env: { ...process.env, CLAUDE_CONFIG_DIR: dir } });
+  const pending = JSON.parse(pendingOut);
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].session_id, 'cli1');
+  execFileSync('node', [SCRIPT, 'claim', 'cli1'], { encoding: 'utf8', env: { ...process.env, CLAUDE_CONFIG_DIR: dir } });
+  const after = JSON.parse(execFileSync('node', [SCRIPT, 'pending', '--json'], { encoding: 'utf8', env: { ...process.env, CLAUDE_CONFIG_DIR: dir } }));
+  assert.equal(after.length, 0);
+});
+
+test('CLI: publish writes the content to the claimed flag\'s computed destination and clears the flag', () => {
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-cli-pub-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-cli-pub-repo-'));
+  const repoDir = initRepoWithBareRemote(root, 'repo'); // same helper Task 4 defines
+  const transcriptFile = path.join(root, 't.jsonl');
+  fs.writeFileSync(transcriptFile, JSON.stringify({ type: 'user', cwd: repoDir, timestamp: new Date().toISOString() }));
+  const contentFile = path.join(root, 'content.md');
+  fs.writeFileSync(contentFile, '# test session\n');
+  const env = { ...process.env, CLAUDE_CONFIG_DIR: configDir };
+  execFileSync('node', [SCRIPT, 'flag'], { input: JSON.stringify({ session_id: 'pub12345678', transcript_path: transcriptFile, cwd: repoDir, reason: 'other' }), encoding: 'utf8', env });
+  execFileSync('node', [SCRIPT, 'claim', 'pub12345678'], { encoding: 'utf8', env });
+  execFileSync('node', [SCRIPT, 'publish', 'pub12345678', '--content-file', contentFile], { encoding: 'utf8', env });
+  const files = fs.readdirSync(path.join(repoDir, 'docs/session-log'));
+  assert.equal(files.length, 1);
+  assert.equal(JSON.parse(execFileSync('node', [SCRIPT, 'pending', '--json'], { encoding: 'utf8', env })).length, 0);
+});
+
+test('CLI with no arguments prints usage and exits non-zero; --help exits 0', () => {
+  assert.throws(() => execFileSync('node', [SCRIPT], { encoding: 'utf8' }));
+  const out = execFileSync('node', [SCRIPT, '--help'], { encoding: 'utf8' });
+  assert.match(out, /session-log/);
 });
