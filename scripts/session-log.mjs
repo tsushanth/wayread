@@ -48,6 +48,11 @@ export function decideLocation(cwdTally) {
   return { kind: 'root' };
 }
 
+// Resolve a transcript file to its destination: alongside one repo, or in the cross-project root.
+export async function locate(transcriptFile) {
+  return decideLocation(await scanCwds(transcriptFile));
+}
+
 // Pending flags: one JSON file per session that ended, written by the SessionEnd hook
 // and drained later by a SessionStart-triggered catch-up.
 export function pendingDir() {

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
-import { scanCwds, decideLocation, resolveRepoRoot, REPO_THRESHOLD, writeFlag, listPending, claimFlag, clearFlag, failFlag } from './session-log.mjs';
+import { scanCwds, decideLocation, resolveRepoRoot, REPO_THRESHOLD, writeFlag, listPending, claimFlag, clearFlag, failFlag, locate } from './session-log.mjs';
 
 function writeJsonl(file, cwds) {
   fs.writeFileSync(file, cwds.map((cwd) => JSON.stringify({ type: 'user', cwd, timestamp: new Date().toISOString() })).join('\n') + '\n');
@@ -106,4 +106,25 @@ test('claimFlag rethrows non-ENOENT filesystem errors instead of treating them a
   // A regular file where the pending directory should be makes rename fail with ENOTDIR, not ENOENT.
   fs.writeFileSync(path.join(dir, 'session-map-pending'), 'not a directory');
   assert.throws(() => claimFlag('s1'), (err) => err.code !== 'ENOENT');
+});
+
+function makeTranscript(dir, cwds) {
+  const file = path.join(dir, 't.jsonl');
+  fs.writeFileSync(file, cwds.map((cwd) => JSON.stringify({ type: 'user', cwd, timestamp: new Date().toISOString() })).join('\n') + '\n');
+  return file;
+}
+
+test('locate resolves a transcript file straight through to a repo-vs-root decision', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-locate-'));
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir });
+  const real = fs.realpathSync(dir);
+  const file = makeTranscript(dir, Array.from({ length: 9 }, () => real).concat(['/elsewhere']));
+  const result = await locate(file);
+  assert.deepEqual(result, { kind: 'repo', repoPath: real });
+});
+
+test('locate falls back to root for a transcript that never touched a repo', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-locate-'));
+  const file = makeTranscript(dir, ['/tmp/scratch', '/tmp/scratch']);
+  assert.deepEqual(await locate(file), { kind: 'root' });
 });
