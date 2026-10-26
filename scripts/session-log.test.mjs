@@ -99,3 +99,11 @@ test('failFlag logs the error and leaves a .failed marker instead of retrying si
   assert.match(log, /transcript not found/);
   assert.equal(fs.existsSync(path.join(dir, 'session-map-pending', 's1.json.failed')), true);
 });
+
+test('claimFlag rethrows non-ENOENT filesystem errors instead of treating them as a lost race', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-pending-'));
+  process.env.CLAUDE_CONFIG_DIR = dir;
+  // A regular file where the pending directory should be makes rename fail with ENOTDIR, not ENOENT.
+  fs.writeFileSync(path.join(dir, 'session-map-pending'), 'not a directory');
+  assert.throws(() => claimFlag('s1'), (err) => err.code !== 'ENOENT');
+});

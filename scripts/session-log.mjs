@@ -69,14 +69,16 @@ export function listPending() {
 }
 
 // Atomic claim: rename is all-or-nothing, so only one racing process can win.
-// Returns null when the flag is missing or another process already claimed it.
+// Returns null when the flag is missing or another process already claimed it;
+// any other filesystem error is rethrown so it is not mistaken for a benign race.
 export function claimFlag(session_id) {
   const from = path.join(pendingDir(), `${session_id}.json`);
   const to = path.join(pendingDir(), `${session_id}.json.processing`);
   try {
     fs.renameSync(from, to);
-  } catch {
-    return null;
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
   }
   return JSON.parse(fs.readFileSync(to, 'utf8'));
 }
