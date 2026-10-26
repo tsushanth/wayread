@@ -18,6 +18,8 @@ If `$ARGUMENTS` is empty, ask the user what requirement to plan for and stop —
    - **Detailed changes** — a concrete, file-by-file plan: which files are touched, what changes in each (new functions/routes/tools, edited logic, new tests, doc updates), and a "what this does NOT change" line if that boundary is easy to get wrong. This is a plan, not a diff — no fabricated code that hasn't been written.
    - A short **open questions / risks** callout if genuinely applicable — skip it if there's nothing real to flag.
 5. **Publish via the `Artifact` tool** using a stable file path so re-running this command (e.g. after the user asks for edits) updates the same page instead of creating a new one. Pick a favicon distinct from `/wayread:system-overview`'s and its `simple` companion, and keep it stable across revisions of a given proposal.
+
+   Also save the same file-by-file plan as data, so `/wayread:live-plan` can follow the work once it starts: write `plan.json` (format and folder in `/wayread:live-plan`) with one step per cohesive change, the exact `writes` for each, real `needs`, every status `pending`, and stages `["Prepare", "Build"]`. Run `node <script> check <plan.json>` to validate it. Don't render or publish the graph here; it is published when implementation starts. If Node is not available, skip this and say so. Keep `plan.json` in step with the page whenever the plan is revised, and report its path with the artifact URL.
 6. **Report the artifact URL**, then ask the user directly: approve as-is, or send back specific edits. Do not start implementing the change in this same command — that's a separate, explicit next step once the user approves.
 
 ## Revising after feedback
