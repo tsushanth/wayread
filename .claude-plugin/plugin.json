@@ -1,7 +1,7 @@
 {
   "name": "wayread",
-  "version": "0.2.0",
-  "description": "Commands for understanding, reviewing and shipping code: orient, trace a use case, review, harden, ship-check, a live plan graph, runbook.",
+  "version": "0.3.0",
+  "description": "Commands for understanding, reviewing and shipping code: orient, trace a use case, review, harden, ship-check, a live plan graph, a decision map of long conversations, runbook.",
   "author": {
     "name": "Sushanth"
   }
