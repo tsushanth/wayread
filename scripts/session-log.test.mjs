@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
-import { scanCwds, decideLocation, resolveRepoRoot, REPO_THRESHOLD } from './session-log.mjs';
+import { scanCwds, decideLocation, resolveRepoRoot, REPO_THRESHOLD, writeFlag, listPending, claimFlag, clearFlag, failFlag } from './session-log.mjs';
 
 function writeJsonl(file, cwds) {
   fs.writeFileSync(file, cwds.map((cwd) => JSON.stringify({ type: 'user', cwd, timestamp: new Date().toISOString() })).join('\n') + '\n');
@@ -51,3 +51,51 @@ test('decideLocation: a tie, or a session that touched no repo at all, goes to r
 });
 
 test('REPO_THRESHOLD is 0.8', () => { assert.equal(REPO_THRESHOLD, 0.8); });
+
+test('writeFlag then listPending round-trips the flag data', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-pending-'));
+  process.env.CLAUDE_CONFIG_DIR = dir;
+  writeFlag({ session_id: 's1', transcript_path: '/t.jsonl', cwd: '/x', reason: 'other', ts: 1 });
+  const pending = listPending();
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].session_id, 's1');
+});
+
+test('two sessions ending at once write two separate flag files', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-pending-'));
+  process.env.CLAUDE_CONFIG_DIR = dir;
+  writeFlag({ session_id: 'a', transcript_path: '/a.jsonl', cwd: '/x', reason: 'other', ts: 1 });
+  writeFlag({ session_id: 'b', transcript_path: '/b.jsonl', cwd: '/y', reason: 'other', ts: 2 });
+  assert.equal(listPending().length, 2);
+});
+
+test('claimFlag removes the flag from listPending and returns its data; a second claim of the same id fails', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-pending-'));
+  process.env.CLAUDE_CONFIG_DIR = dir;
+  writeFlag({ session_id: 's1', transcript_path: '/t.jsonl', cwd: '/x', reason: 'other', ts: 1 });
+  const claimed = claimFlag('s1');
+  assert.equal(claimed.session_id, 's1');
+  assert.equal(listPending().length, 0);
+  assert.equal(claimFlag('s1'), null); // already claimed — simulates a second, racing catch-up
+});
+
+test('clearFlag removes the claimed (.processing) file', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-pending-'));
+  process.env.CLAUDE_CONFIG_DIR = dir;
+  writeFlag({ session_id: 's1', transcript_path: '/t.jsonl', cwd: '/x', reason: 'other', ts: 1 });
+  claimFlag('s1');
+  clearFlag('s1');
+  assert.equal(fs.existsSync(path.join(dir, 'session-map-pending', 's1.json.processing')), false);
+});
+
+test('failFlag logs the error and leaves a .failed marker instead of retrying silently', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-pending-'));
+  process.env.CLAUDE_CONFIG_DIR = dir;
+  writeFlag({ session_id: 's1', transcript_path: '/missing.jsonl', cwd: '/x', reason: 'other', ts: 1 });
+  claimFlag('s1');
+  failFlag('s1', 'transcript not found');
+  const log = fs.readFileSync(path.join(dir, 'session-map-pending', 'errors.log'), 'utf8');
+  assert.match(log, /s1/);
+  assert.match(log, /transcript not found/);
+  assert.equal(fs.existsSync(path.join(dir, 'session-map-pending', 's1.json.failed')), true);
+});

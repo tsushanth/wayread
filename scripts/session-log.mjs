@@ -1,4 +1,6 @@
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import readline from 'node:readline';
 import { execFileSync } from 'node:child_process';
 
@@ -44,4 +46,49 @@ export function decideLocation(cwdTally) {
   }
   if (top.key !== null && top.count / total >= REPO_THRESHOLD) return { kind: 'repo', repoPath: top.key };
   return { kind: 'root' };
+}
+
+// Pending flags: one JSON file per session that ended, written by the SessionEnd hook
+// and drained later by a SessionStart-triggered catch-up.
+export function pendingDir() {
+  return path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'session-map-pending');
+}
+
+export function writeFlag({ session_id, transcript_path, cwd, reason, ts }) {
+  fs.mkdirSync(pendingDir(), { recursive: true });
+  const data = { session_id, transcript_path, cwd, reason, ts };
+  fs.writeFileSync(path.join(pendingDir(), `${session_id}.json`), JSON.stringify(data));
+}
+
+export function listPending() {
+  const dir = pendingDir();
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir)
+    .filter((f) => f.endsWith('.json'))
+    .map((f) => JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')));
+}
+
+// Atomic claim: rename is all-or-nothing, so only one racing process can win.
+// Returns null when the flag is missing or another process already claimed it.
+export function claimFlag(session_id) {
+  const from = path.join(pendingDir(), `${session_id}.json`);
+  const to = path.join(pendingDir(), `${session_id}.json.processing`);
+  try {
+    fs.renameSync(from, to);
+  } catch {
+    return null;
+  }
+  return JSON.parse(fs.readFileSync(to, 'utf8'));
+}
+
+export function clearFlag(session_id) {
+  fs.rmSync(path.join(pendingDir(), `${session_id}.json.processing`), { force: true });
+}
+
+// Failed flags are kept for manual follow-up and never auto-retried.
+export function failFlag(session_id, message) {
+  const dir = pendingDir();
+  fs.mkdirSync(dir, { recursive: true });
+  fs.appendFileSync(path.join(dir, 'errors.log'), `${new Date().toISOString()} ${session_id} ${message}\n`);
+  fs.renameSync(path.join(dir, `${session_id}.json.processing`), path.join(dir, `${session_id}.json.failed`));
 }
