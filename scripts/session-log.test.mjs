@@ -248,12 +248,13 @@ test('writeAndPublish succeeds on a brand-new repo pushing its very first commit
   assert.match(bareLog, /session log: first/);
 });
 
-test('writeAndPublish reports a push rejection without force-pushing, leaving the local commit and the remote intact', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-publish-reject-'));
+// Sets up a repo whose next push will be rejected: a second clone pushes ahead first, so the
+// original clone's push is a non-fast-forward. Shared by the rejection test and the retry test
+// below (finding #2: a failed push must not permanently strand the repo for later retries).
+function makeRepoWithPendingRejection(root) {
   const dir = initRepoWithBareRemote(root, 'repo');
   const bare = path.join(root, 'repo.git');
 
-  // A second clone pushes ahead first, so the original clone's next push is a non-fast-forward.
   // The bare repo's own HEAD symref still points at the never-created default branch (the
   // fixture only ever created "main" via push -u, never touched the bare's HEAD), so a plain
   // clone checks out an unrelated empty branch — explicitly track "main" instead.
@@ -268,6 +269,13 @@ test('writeAndPublish reports a push rejection without force-pushing, leaving th
   execFileSync('git', ['commit', '-q', '-m', 'other change'], { cwd: clone2 });
   execFileSync('git', ['push', '-q'], { cwd: clone2 });
 
+  return { dir, bare };
+}
+
+test('writeAndPublish reports a push rejection without force-pushing, and rolls its own commit back so the remote is untouched and the branch is not left stranded', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-publish-reject-'));
+  const { dir, bare } = makeRepoWithPendingRejection(root);
+
   const beforeLog = execFileSync('git', ['--git-dir', bare, 'log', '--oneline', 'main'], { encoding: 'utf8' });
 
   const result = writeAndPublish({ repoRoot: dir, relPath: 'docs/session-log/2026-10-26-reject.md', content: '# reject\n', commitMessage: 'session log: reject' });
@@ -275,10 +283,26 @@ test('writeAndPublish reports a push rejection without force-pushing, leaving th
   assert.match(result.error, /rejected|fetch first|non-fast-forward/i);
 
   const localLog = execFileSync('git', ['log', '--oneline'], { cwd: dir, encoding: 'utf8' });
-  assert.match(localLog, /session log: reject/); // the local commit is still there — never reset or dropped
+  assert.doesNotMatch(localLog, /session log: reject/); // the failed attempt's own commit was rolled back, not left stranded on the branch
 
   const afterLog = execFileSync('git', ['--git-dir', bare, 'log', '--oneline', 'main'], { encoding: 'utf8' });
   assert.equal(afterLog, beforeLog); // the remote is byte-for-byte unchanged by the failed attempt
+});
+
+test('a rejected push does not permanently block later publish attempts to the same repo via the unpushed-commits gate', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-publish-retry-'));
+  const { dir } = makeRepoWithPendingRejection(root);
+
+  const first = writeAndPublish({ repoRoot: dir, relPath: 'docs/session-log/2026-10-26-retry-a.md', content: '# retry a\n', commitMessage: 'session log: retry a' });
+  assert.equal(first.ok, false);
+
+  // The retry (different content) must not be refused by this tool's own "unpushed work"
+  // safety gate — that would mean the first failed attempt's commit was never cleaned up.
+  // (It may still legitimately fail again on the same stale non-fast-forward push — this tool
+  // never fetches — but that is a distinct, honest failure each time, not a permanent gate block.)
+  const second = writeAndPublish({ repoRoot: dir, relPath: 'docs/session-log/2026-10-26-retry-b.md', content: '# retry b\n', commitMessage: 'session log: retry b' });
+  assert.equal(second.ok, false);
+  assert.doesNotMatch(second.error, /unpushed commit/i);
 });
 
 test('writeAndPublish refuses to publish from a detached HEAD', () => {
@@ -299,6 +323,43 @@ test('writeAndPublish rejects a relPath that escapes the repo root', () => {
   assert.equal(result.ok, false);
   assert.match(result.error, /relative|traverse/i);
   assert.equal(fs.existsSync(path.join(root, 'escape.md')), false);
+});
+
+test('writeAndPublish scans the raw content before ever writing it to disk, so a leaky string never lands in the file at all', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-publish-precommit-leak-'));
+  const dir = initRepoWithBareRemote(root, 'repo');
+  const relPath = 'docs/session-log/2026-10-26-precommit-leak.md';
+  const result = writeAndPublish({ repoRoot: dir, relPath, content: "key: AKIAABCDEFGHIJKLMNOP\n", commitMessage: 'session log: precommit leak' });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /gitleaks|secret|leak/i);
+  assert.equal(fs.existsSync(path.join(dir, relPath)), false); // never written, not just never pushed
+  const log = execFileSync('git', ['log', '--oneline'], { cwd: dir, encoding: 'utf8' });
+  assert.doesNotMatch(log, /precommit leak/); // and never committed either
+});
+
+test('writeAndPublish gives a distinct "no remote configured" error, and rolls back its own commit rather than stranding it', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-publish-noremote-'));
+  const dir = path.join(root, 'repo');
+  fs.mkdirSync(dir, { recursive: true });
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir });
+  execFileSync('git', ['config', 'user.email', 't@example.test'], { cwd: dir });
+  execFileSync('git', ['config', 'user.name', 'T'], { cwd: dir });
+  disableHooks(dir);
+  fs.writeFileSync(path.join(dir, 'seed.txt'), 'seed\n');
+  execFileSync('git', ['add', '.'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'seed'], { cwd: dir });
+
+  const result = writeAndPublish({ repoRoot: dir, relPath: 'docs/session-log/2026-10-26-noremote.md', content: '# noremote\n', commitMessage: 'session log: noremote' });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /no remote configured/i);
+
+  const log = execFileSync('git', ['log', '--oneline'], { cwd: dir, encoding: 'utf8' });
+  assert.doesNotMatch(log, /session log: noremote/); // rolled back, not stranded on the branch
+
+  // A later retry gets the same clear, distinct error again — not blocked by the unpushed gate.
+  const second = writeAndPublish({ repoRoot: dir, relPath: 'docs/session-log/2026-10-26-noremote2.md', content: '# noremote2\n', commitMessage: 'session log: noremote2' });
+  assert.equal(second.ok, false);
+  assert.match(second.error, /no remote configured/i);
 });
 
 test('writeFallbackEntry writes a minimal, honest note when the transcript is gone', () => {
@@ -333,6 +394,72 @@ test('destinationFor a cross-cutting session creates and uses the session-logs r
   assert.equal(dest.repoRoot, path.join(home, 'Documents/GitHub/session-logs'));
   assert.equal(dest.relPath, '2026-10-27/xyz99999.md');
   assert.equal(fs.existsSync(path.join(dest.repoRoot, '.git')), true); // created on demand
+});
+
+test('destinationFor degrades to a flag.cwd-based decision instead of throwing when the transcript file is gone', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-dest-missing-'));
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir });
+  const real = fs.realpathSync(dir);
+  const dest = await destinationFor({ session_id: 'missing1234', transcript_path: path.join(dir, 'does-not-exist.jsonl'), cwd: real, ts: Date.parse('2026-10-26T00:00:00Z') });
+  assert.equal(dest.repoRoot, real);
+  assert.equal(dest.relPath, 'docs/session-log/2026-10-26-missing1.md');
+});
+
+test('CLI: fallback on a claimed flag with a nonexistent transcript_path succeeds instead of crashing, clearing the flag', () => {
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-cli-fallback-missing-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-cli-fallback-missing-repo-'));
+  const repoDir = initRepoWithBareRemote(root, 'repo');
+  const env = { ...process.env, CLAUDE_CONFIG_DIR: configDir };
+  const missingTranscript = path.join(root, 'gone.jsonl'); // never created — simulates a transcript past retention
+  execFileSync('node', [SCRIPT, 'flag'], { input: JSON.stringify({ session_id: 'fb12345678', transcript_path: missingTranscript, cwd: repoDir, reason: 'other' }), encoding: 'utf8', env });
+  execFileSync('node', [SCRIPT, 'claim', 'fb12345678'], { encoding: 'utf8', env });
+  execFileSync('node', [SCRIPT, 'fallback', 'fb12345678'], { encoding: 'utf8', env }); // must not throw/crash
+  const files = fs.readdirSync(path.join(repoDir, 'docs/session-log'));
+  assert.equal(files.length, 1);
+  assert.match(fs.readFileSync(path.join(repoDir, 'docs/session-log', files[0]), 'utf8'), /no longer available/);
+  assert.equal(JSON.parse(execFileSync('node', [SCRIPT, 'pending', '--json'], { encoding: 'utf8', env })).length, 0);
+  assert.equal(fs.existsSync(path.join(configDir, 'session-map-pending', 'fb12345678.json.processing')), false);
+  assert.equal(fs.existsSync(path.join(configDir, 'session-map-pending', 'fb12345678.json.failed')), false);
+});
+
+test('CLI: publish on a claimed flag with a missing --content-file fails the flag to .failed instead of throwing uncaught', () => {
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-cli-pub-missingcf-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-cli-pub-missingcf-repo-'));
+  const repoDir = initRepoWithBareRemote(root, 'repo');
+  const transcriptFile = path.join(root, 't.jsonl');
+  fs.writeFileSync(transcriptFile, JSON.stringify({ type: 'user', cwd: repoDir, timestamp: new Date().toISOString() }));
+  const env = { ...process.env, CLAUDE_CONFIG_DIR: configDir };
+  execFileSync('node', [SCRIPT, 'flag'], { input: JSON.stringify({ session_id: 'mcf12345678', transcript_path: transcriptFile, cwd: repoDir, reason: 'other' }), encoding: 'utf8', env });
+  execFileSync('node', [SCRIPT, 'claim', 'mcf12345678'], { encoding: 'utf8', env });
+  assert.throws(() => execFileSync('node', [SCRIPT, 'publish', 'mcf12345678', '--content-file', path.join(root, 'does-not-exist.md')], { encoding: 'utf8', env }));
+  assert.equal(fs.existsSync(path.join(configDir, 'session-map-pending', 'mcf12345678.json.processing')), false); // never stuck as .processing
+  assert.equal(fs.existsSync(path.join(configDir, 'session-map-pending', 'mcf12345678.json.failed')), true);
+  const log = fs.readFileSync(path.join(configDir, 'session-map-pending', 'errors.log'), 'utf8');
+  assert.match(log, /mcf12345678/);
+});
+
+test('CLI: publish on a claimed flag with no --content-file at all fails the flag to .failed instead of throwing uncaught', () => {
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-cli-pub-nocf-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-cli-pub-nocf-repo-'));
+  const repoDir = initRepoWithBareRemote(root, 'repo');
+  const transcriptFile = path.join(root, 't.jsonl');
+  fs.writeFileSync(transcriptFile, JSON.stringify({ type: 'user', cwd: repoDir, timestamp: new Date().toISOString() }));
+  const env = { ...process.env, CLAUDE_CONFIG_DIR: configDir };
+  execFileSync('node', [SCRIPT, 'flag'], { input: JSON.stringify({ session_id: 'ncf12345678', transcript_path: transcriptFile, cwd: repoDir, reason: 'other' }), encoding: 'utf8', env });
+  execFileSync('node', [SCRIPT, 'claim', 'ncf12345678'], { encoding: 'utf8', env });
+  assert.throws(() => execFileSync('node', [SCRIPT, 'publish', 'ncf12345678'], { encoding: 'utf8', env }));
+  assert.equal(fs.existsSync(path.join(configDir, 'session-map-pending', 'ncf12345678.json.processing')), false);
+  assert.equal(fs.existsSync(path.join(configDir, 'session-map-pending', 'ncf12345678.json.failed')), true);
+});
+
+test('CLI: flag rejects a stdin payload missing transcript_path instead of writing a flag that would later crash destinationFor', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-cli-flag-notp-'));
+  const env = { ...process.env, CLAUDE_CONFIG_DIR: dir };
+  assert.throws(() => execFileSync('node', [SCRIPT, 'flag'], { input: JSON.stringify({ session_id: 'notp1234567' }), encoding: 'utf8', env }));
+  const pending = JSON.parse(execFileSync('node', [SCRIPT, 'pending', '--json'], { encoding: 'utf8', env }));
+  assert.equal(pending.length, 0);
+  const log = fs.readFileSync(path.join(dir, 'session-map-pending', 'errors.log'), 'utf8');
+  assert.match(log, /transcript_path/);
 });
 
 test('CLI: flag reads hook stdin JSON and writes a pending flag; pending lists it; claim removes it', () => {

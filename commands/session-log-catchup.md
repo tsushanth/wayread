@@ -46,7 +46,7 @@ One folder per session: the session scratchpad directory if the system prompt na
 
 ## What this does not do
 
-- It does not run on a schedule. It runs when a session starts (through the plugin's session-start hook) or when someone runs it by hand.
+- It does not run on a schedule. It runs when a session starts, through a SessionStart hook configured in your personal `~/.claude/settings.json` (the plugin itself does not ship or auto-install that hook), or when someone runs it by hand.
 - It does not retry failures. A failed flag stays in the pending folder as `.failed` until someone looks at `errors.log` and decides.
 - It does not read tool output or file contents beyond the conversation transcript the digest produces.
 - It does not push to anything except the git remote of the repo `publish` writes to.

@@ -64,6 +64,22 @@ export async function locate(transcriptFile) {
   return decideLocation(await scanCwds(transcriptFile));
 }
 
+// Same decision as `locate`, but degrades gracefully when the transcript file is gone (past
+// retention, deleted, etc.) instead of letting scanCwds's ENOENT propagate. Falls back to a
+// single-entry tally of `cwd` alone — "where was this session when it ended" is still a
+// reasonable signal for repo-vs-root even with no transcript to read.
+async function locateOrFallbackToCwd(transcriptFile, cwd) {
+  try {
+    return await locate(transcriptFile);
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      const tally = typeof cwd === 'string' && cwd ? new Map([[cwd, 1]]) : new Map();
+      return decideLocation(tally);
+    }
+    throw error;
+  }
+}
+
 // Pending flags: one JSON file per session that ended, written by the SessionEnd hook
 // and drained later by a SessionStart-triggered catch-up.
 export function pendingDir() {
@@ -186,6 +202,37 @@ export function gitleaksCheck(repoRoot) {
   }
 }
 
+// Scans the raw content string itself, before it is ever written to disk or committed — these
+// summaries quote a session's own transcript, and a user can paste a real secret into chat.
+// gitleaks needs a path to scan, so the content is written to an isolated temp file (never
+// inside a git work tree) and scanned with --no-git, which doesn't care about commit history.
+function gitleaksCheckContent(content) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'session-log-scan-'));
+  try {
+    fs.writeFileSync(path.join(tmpDir, 'content'), content);
+    execFileSync('gitleaks', ['detect', '--no-git', '--source', tmpDir, '--redact'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...GIT_EXEC_SAFETY,
+    });
+  } catch (error) {
+    const output = [error.stdout, error.stderr].filter(Boolean).join('\n');
+    throw new Error(`gitleaks detected potential secrets in the content itself (before writing or committing it):\n${output || error.message}`);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+// Undoes exactly the one commit writeAndPublish itself just made, moving the branch pointer
+// back without touching the working tree/index further — used when a step AFTER that commit
+// (the secrets scan, or the push) fails, so a failed publish attempt never leaves a stray local
+// commit that permanently blocks every later retry via the unpushed-work gate above.
+function rollbackLastCommit(repoRoot) {
+  try {
+    execFileSync('git', ['-C', repoRoot, 'reset', '--soft', 'HEAD~1'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch {
+    // Best-effort: if this itself fails there's nothing safer to do than report the original error.
+  }
+}
+
 // Write a file, commit it, scan exactly the commits about to be pushed, then push.
 // Order of operations, each a hard gate on the next:
 //   1. relPath is validated (no absolute paths, no `..` traversal); HEAD must be a real branch,
@@ -233,6 +280,12 @@ export function writeAndPublish({ repoRoot, relPath, content, commitMessage }) {
     };
   }
 
+  try {
+    gitleaksCheckContent(content);
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+
   const fullPath = path.join(repoRoot, relPath);
   let sha;
   try {
@@ -249,16 +302,21 @@ export function writeAndPublish({ repoRoot, relPath, content, commitMessage }) {
   try {
     gitleaksCheck(repoRoot);
   } catch (error) {
+    rollbackLastCommit(repoRoot);
     return { ok: false, error: error.message };
   }
 
   try {
     const branch = currentBranch(repoRoot);
     const remote = pickRemote(repoRoot);
-    if (!remote) return { ok: false, error: `${repoRoot} has no git remote configured; commit ${sha} is local only` };
+    if (!remote) {
+      rollbackLastCommit(repoRoot);
+      return { ok: false, error: `${repoRoot} has no remote configured; refusing to leave an unpushable commit on this branch (the commit has been rolled back)` };
+    }
     execFileSync('git', ['-C', repoRoot, 'push', remote, `HEAD:${branch}`], { stdio: ['ignore', 'pipe', 'pipe'], ...GIT_EXEC_SAFETY });
   } catch (error) {
     const output = [error.stdout?.toString?.(), error.stderr?.toString?.()].filter(Boolean).join('\n');
+    rollbackLastCommit(repoRoot);
     return { ok: false, error: output || error.message };
   }
 
@@ -293,7 +351,7 @@ function ensureSessionLogsRoot() {
 export async function destinationFor(flag) {
   const date = new Date(flag.ts).toISOString().slice(0, 10);
   const shortId = flag.session_id.slice(0, 8);
-  const decision = await locate(flag.transcript_path);
+  const decision = await locateOrFallbackToCwd(flag.transcript_path, flag.cwd);
   if (decision.kind === 'repo') {
     return { repoRoot: decision.repoPath, relPath: `docs/session-log/${date}-${shortId}.md` };
   }
@@ -333,6 +391,7 @@ async function main(argv) {
     try {
       const raw = JSON.parse(readStdin());
       if (!raw || typeof raw.session_id !== 'string' || !raw.session_id) throw new Error('missing session_id');
+      if (typeof raw.transcript_path !== 'string' || !raw.transcript_path) throw new Error('missing transcript_path');
       data = { session_id: raw.session_id, transcript_path: raw.transcript_path, cwd: raw.cwd, reason: raw.reason, ts: Date.now() };
       writeFlag(data);
     } catch (error) {
@@ -362,17 +421,28 @@ async function main(argv) {
   if (cmd === 'publish') {
     const [id] = rest;
     const contentFileArg = cliFlag(rest, '--content-file');
-    if (!id || !contentFileArg) throw new Error('usage: publish <session_id> --content-file <path>');
+    if (!id) throw new Error('usage: publish <session_id> --content-file <path>');
     const processingPath = path.join(pendingDir(), `${id}.json.processing`);
     if (!fs.existsSync(processingPath)) throw new Error(`${id} is not claimed; run claim first`);
-    const flagData = JSON.parse(fs.readFileSync(processingPath, 'utf8'));
-    const { repoRoot, relPath } = await destinationFor(flagData);
-    const content = contentFileArg === '-' ? readStdin() : fs.readFileSync(contentFileArg, 'utf8');
-    const result = writeAndPublish({ repoRoot, relPath, content, commitMessage: `session log: ${id.slice(0, 8)}` });
-    if (result.ok) { clearFlag(id); return 0; }
-    failFlag(id, result.error);
-    console.error(`publish failed for ${id}: ${result.error}`);
-    return 1;
+    // Everything from here on is downstream of a successful claim: any throw in this span —
+    // a missing/unreadable --content-file, a malformed flag file, a bad transcript_path, etc. —
+    // must end in failFlag, never an uncaught exception that strands the flag as `.processing`.
+    try {
+      if (!contentFileArg) throw new Error('usage: publish <session_id> --content-file <path>');
+      if (contentFileArg !== '-' && !fs.existsSync(contentFileArg)) throw new Error(`--content-file not found: ${contentFileArg}`);
+      const flagData = JSON.parse(fs.readFileSync(processingPath, 'utf8'));
+      const { repoRoot, relPath } = await destinationFor(flagData);
+      const content = contentFileArg === '-' ? readStdin() : fs.readFileSync(contentFileArg, 'utf8');
+      const result = writeAndPublish({ repoRoot, relPath, content, commitMessage: `session log: ${id.slice(0, 8)}` });
+      if (result.ok) { clearFlag(id); return 0; }
+      failFlag(id, result.error);
+      console.error(`publish failed for ${id}: ${result.error}`);
+      return 1;
+    } catch (error) {
+      failFlag(id, error.message);
+      console.error(`publish failed for ${id}: ${error.message}`);
+      return 1;
+    }
   }
 
   if (cmd === 'fallback') {
@@ -380,13 +450,22 @@ async function main(argv) {
     if (!id) throw new Error('usage: fallback <session_id>');
     const processingPath = path.join(pendingDir(), `${id}.json.processing`);
     if (!fs.existsSync(processingPath)) throw new Error(`${id} is not claimed; run claim first`);
-    const flagData = JSON.parse(fs.readFileSync(processingPath, 'utf8'));
-    const { repoRoot, relPath } = await destinationFor(flagData);
-    const result = writeFallbackEntry({ repoRoot, relPath, sessionId: flagData.session_id, endedAt: new Date(flagData.ts).toISOString() });
-    if (result.ok) { clearFlag(id); return 0; }
-    failFlag(id, result.error);
-    console.error(`fallback failed for ${id}: ${result.error}`);
-    return 1;
+    // Same rule as publish above: nothing downstream of a successful claim may throw without
+    // clearing the flag to `.failed` — this is exactly the "missing transcript" scenario
+    // fallback exists for, and it must never strand the flag as `.processing` forever.
+    try {
+      const flagData = JSON.parse(fs.readFileSync(processingPath, 'utf8'));
+      const { repoRoot, relPath } = await destinationFor(flagData);
+      const result = writeFallbackEntry({ repoRoot, relPath, sessionId: flagData.session_id, endedAt: new Date(flagData.ts).toISOString() });
+      if (result.ok) { clearFlag(id); return 0; }
+      failFlag(id, result.error);
+      console.error(`fallback failed for ${id}: ${result.error}`);
+      return 1;
+    } catch (error) {
+      failFlag(id, error.message);
+      console.error(`fallback failed for ${id}: ${error.message}`);
+      return 1;
+    }
   }
 
   throw new Error(`unknown command ${JSON.stringify(cmd)}`);
