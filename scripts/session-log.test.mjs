@@ -199,7 +199,7 @@ test('writeAndPublish never pushes a commit that trips the secrets scan', () => 
   assert.doesNotMatch(bareLog, /session log: leak/); // local commit may exist, but it never reached the remote itself
 });
 
-test('writeAndPublish refuses to touch a repo that already has other unpushed commits sitting on it', () => {
+test('writeAndPublish refuses to touch a branch that already has other unpushed commits on it', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-publish-scoped-'));
   const dir = initRepoWithBareRemote(root, 'repo');
   // Someone else's real, committed-but-unpushed work already on this branch.
@@ -209,10 +209,30 @@ test('writeAndPublish refuses to touch a repo that already has other unpushed co
 
   const result = writeAndPublish({ repoRoot: dir, relPath: 'docs/session-log/2026-10-26-scoped.md', content: '# scoped\n', commitMessage: 'session log: scoped' });
   assert.equal(result.ok, false);
-  assert.match(result.error, /unpushed|uncommitted/i);
+  assert.match(result.error, /unpushed commit/i);
   assert.equal(fs.existsSync(path.join(dir, 'docs/session-log/2026-10-26-scoped.md')), false); // never even wrote the file
   const bareLog = execFileSync('git', ['--git-dir', path.join(root, 'repo.git'), 'log', '--oneline', 'main'], { encoding: 'utf8' });
   assert.doesNotMatch(bareLog, /scoped/); // and the remote never saw any of it
+});
+
+test('writeAndPublish succeeds even with an unrelated stash or another local branch ahead — only the current branch vs its own remote tracking matters', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-publish-stash-'));
+  const dir = initRepoWithBareRemote(root, 'repo');
+  // An unrelated stash and an unrelated second branch ahead of its own remote — neither is part
+  // of what a scoped `git push HEAD:main` would ever send, so neither should block this.
+  fs.writeFileSync(path.join(dir, 'scratch.txt'), 'scratch\n');
+  execFileSync('git', ['add', 'scratch.txt'], { cwd: dir });
+  execFileSync('git', ['stash', 'push', '-m', 'unrelated wip'], { cwd: dir });
+  execFileSync('git', ['checkout', '-q', '-b', 'other-branch'], { cwd: dir });
+  fs.writeFileSync(path.join(dir, 'other-branch-file.txt'), 'x\n');
+  execFileSync('git', ['add', '.'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'unrelated branch work'], { cwd: dir });
+  execFileSync('git', ['checkout', '-q', 'main'], { cwd: dir });
+
+  const result = writeAndPublish({ repoRoot: dir, relPath: 'docs/session-log/2026-10-26-stash.md', content: '# stash\n', commitMessage: 'session log: stash' });
+  assert.equal(result.ok, true);
+  const bareLog = execFileSync('git', ['--git-dir', path.join(root, 'repo.git'), 'log', '--oneline', 'main'], { encoding: 'utf8' });
+  assert.match(bareLog, /session log: stash/);
 });
 
 test('writeAndPublish succeeds on a brand-new repo pushing its very first commit, with no upstream configured yet', () => {
@@ -228,10 +248,6 @@ test('writeAndPublish reports a push rejection without force-pushing, leaving th
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-publish-reject-'));
   const dir = initRepoWithBareRemote(root, 'repo');
   const bare = path.join(root, 'repo.git');
-  // Plain git allows non-fast-forward updates to a bare repo by default (receive.denyNonFastForwards
-  // defaults to false) — real hosts (GitHub, etc.) reject them, so this mirrors that real protection
-  // rather than testing a push mechanic this tool would otherwise just silently clobber with.
-  execFileSync('git', ['--git-dir', bare, 'config', 'receive.denyNonFastForwards', 'true']);
 
   // A second clone pushes ahead first, so the original clone's next push is a non-fast-forward.
   // The bare repo's own HEAD symref still points at the never-created default branch (the
@@ -252,12 +268,24 @@ test('writeAndPublish reports a push rejection without force-pushing, leaving th
 
   const result = writeAndPublish({ repoRoot: dir, relPath: 'docs/session-log/2026-10-26-reject.md', content: '# reject\n', commitMessage: 'session log: reject' });
   assert.equal(result.ok, false);
+  assert.match(result.error, /rejected|fetch first|non-fast-forward/i);
 
   const localLog = execFileSync('git', ['log', '--oneline'], { cwd: dir, encoding: 'utf8' });
   assert.match(localLog, /session log: reject/); // the local commit is still there — never reset or dropped
 
   const afterLog = execFileSync('git', ['--git-dir', bare, 'log', '--oneline', 'main'], { encoding: 'utf8' });
   assert.equal(afterLog, beforeLog); // the remote is byte-for-byte unchanged by the failed attempt
+});
+
+test('writeAndPublish refuses to publish from a detached HEAD', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-publish-detached-'));
+  const dir = initRepoWithBareRemote(root, 'repo');
+  const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
+  execFileSync('git', ['checkout', '-q', sha], { cwd: dir }); // detach
+
+  const result = writeAndPublish({ repoRoot: dir, relPath: 'docs/session-log/2026-10-26-detached.md', content: '# detached\n', commitMessage: 'session log: detached' });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /detached/i);
 });
 
 test('writeAndPublish rejects a relPath that escapes the repo root', () => {

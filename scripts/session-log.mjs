@@ -3,7 +3,6 @@ import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { execFileSync } from 'node:child_process';
-import { scanRepo, isClean } from './unpushed-work.mjs';
 
 export const REPO_THRESHOLD = 0.8;
 
@@ -112,8 +111,15 @@ function assertSafeRelPath(relPath) {
   if (segments.includes('..')) throw new Error(`relPath must not traverse outside the repo: ${relPath}`);
 }
 
+// The branch HEAD is on, including an unborn branch that has no commits yet (symbolic-ref still
+// resolves, where `rev-parse --abbrev-ref HEAD` errors out). Returns the literal 'HEAD' for a
+// detached HEAD (symbolic-ref fails there, by definition), which callers treat as "not a branch".
 function currentBranch(repoRoot) {
-  return execFileSync('git', ['-C', repoRoot, 'rev-parse', '--abbrev-ref', 'HEAD'], { encoding: 'utf8' }).trim();
+  try {
+    return execFileSync('git', ['-C', repoRoot, 'symbolic-ref', '--short', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch {
+    return 'HEAD';
+  }
 }
 
 // Prefers 'origin' (this project's convention); falls back to whatever single remote exists.
@@ -133,16 +139,28 @@ function remoteRefExists(repoRoot, remote, branch) {
   }
 }
 
+// Local-only, no-network check for history already on this branch beyond its last-known remote
+// state: counts commits on `branch` that aren't reachable from `<remote>/<branch>`. Returns null
+// (nothing to compare against — the legitimate first-push-ever case) when that remote-tracking
+// ref doesn't exist locally yet.
+function commitsAheadOfRemoteTracking(repoRoot, remote, branch) {
+  if (!remoteRefExists(repoRoot, remote, branch)) return null;
+  const out = execFileSync('git', ['-C', repoRoot, 'rev-list', '--count', branch, '--not', `${remote}/${branch}`], { encoding: 'utf8' }).trim();
+  return Number(out);
+}
+
 // Scans exactly the commits the subsequent push will send: `<remote>/<branch>..HEAD` when that
-// remote-tracking ref already resolves locally, or the whole (cheap, fresh) history when it
-// doesn't yet — the same branch/remote this function's caller is about to push to, not `@{u}`,
-// so the scanned range can never silently diverge from the pushed range. Throws with gitleaks's
-// own output (plus the offending commit SHA) on any finding or error; returns normally when clean.
+// remote-tracking ref already resolves locally, or everything on this branch not already on some
+// remote (`HEAD --not --remotes`) when it doesn't yet — the same branch/remote this function's
+// caller is about to push to, not `@{u}`, so the scanned range can never silently diverge from
+// the pushed range, and a brand-new branch's first push isn't blocked by pre-existing findings
+// deep in history it shares with other branches already on a remote. Throws with gitleaks's own
+// output (plus the offending commit SHA) on any finding or error; returns normally when clean.
 export function gitleaksCheck(repoRoot) {
   const branch = currentBranch(repoRoot);
   const remote = pickRemote(repoRoot);
-  const range = remoteRefExists(repoRoot, remote, branch) ? `${remote}/${branch}..HEAD` : null;
-  const args = ['git', `--log-opts=${range ?? ''}`, '--redact', '.'];
+  const range = remoteRefExists(repoRoot, remote, branch) ? `${remote}/${branch}..HEAD` : 'HEAD --not --remotes';
+  const args = ['git', `--log-opts=${range}`, '--redact', '.'];
   try {
     execFileSync('gitleaks', args, { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...GIT_EXEC_SAFETY });
   } catch (error) {
@@ -159,10 +177,15 @@ export function gitleaksCheck(repoRoot) {
 
 // Write a file, commit it, scan exactly the commits about to be pushed, then push.
 // Order of operations, each a hard gate on the next:
-//   1. relPath is validated (no absolute paths, no `..` traversal).
-//   2. The target repo must already be clean (nothing else uncommitted/unpushed on it) — this
-//      tool only ever adds its own one commit, and never sweeps up or publishes anyone else's
-//      unrelated work sitting in the same repo.
+//   1. relPath is validated (no absolute paths, no `..` traversal); HEAD must be a real branch,
+//      not detached (a detached HEAD has no branch name to push, so `HEAD:HEAD` would be wrong).
+//   2. The current branch must already match its last-known remote-tracking state (no network
+//      call — purely local refs): if `<remote>/<branch>` exists locally and `branch` has commits
+//      not reachable from it, this tool refuses rather than sweeping unrelated local-only
+//      history into what it pushes. If no such remote-tracking ref exists yet, there's nothing
+//      to compare against (the legitimate first-push-ever case) and this check is skipped.
+//      Stashes, other branches, and dangling commits are irrelevant to a scoped
+//      `git push HEAD:<branch>` and are deliberately NOT checked here.
 //   3. The file is written and committed, scoped to exactly that one file (`commit -- relPath`),
 //      so nothing else staged in the index gets swept into the commit.
 //   4. gitleaksCheck runs on the new commit — a leak throws, and writeAndPublish returns
@@ -179,17 +202,23 @@ export function writeAndPublish({ repoRoot, relPath, content, commitMessage }) {
     return { ok: false, error: error.message };
   }
 
-  let guard;
+  const branchBefore = currentBranch(repoRoot);
+  if (branchBefore === 'HEAD') {
+    return { ok: false, error: `${repoRoot} has a detached HEAD, not a branch; refusing to publish from it` };
+  }
+  const remoteBefore = pickRemote(repoRoot);
+  let ahead;
   try {
-    guard = scanRepo(repoRoot, { fetch: false }); // no network call — a local safety gate, not a sync check
+    ahead = commitsAheadOfRemoteTracking(repoRoot, remoteBefore, branchBefore);
   } catch (error) {
     return { ok: false, error: error.message };
   }
-  if (!isClean(guard)) {
+  if (ahead !== null && ahead > 0) {
     return {
       ok: false,
-      error: `${repoRoot} has other unpushed/uncommitted work; refusing to commit onto it to avoid pushing ` +
-        `something unrelated — resolve that first (see /sush-unpushed-work)`,
+      error: `${repoRoot} branch "${branchBefore}" has ${ahead} unpushed commit${ahead === 1 ? '' : 's'} relative ` +
+        `to ${remoteBefore}/${branchBefore}; refusing to commit onto it to avoid pushing something unrelated — ` +
+        `resolve that first (see /sush-unpushed-work)`,
     };
   }
 
