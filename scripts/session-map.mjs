@@ -196,77 +196,147 @@ const orderKey = (map, n) => {
 
 /**
  * Places every node on a row and a lane. Route nodes are lane 0, one row each. Everything else hangs off the route in
- * a "track": a fork from a route node plus the chain of nodes that follow it. Tracks get the nearest lane that is free
- * for the span they cover, so no two tracks share a lane at the same time. `row` and `lane` on a node override this.
+ * a "track": a fork from a node plus the chain of nodes that follow it. A node's first child continues its lane;
+ * further children fork onto new lanes. Lanes are reserved for the span a track covers, so two tracks never share a
+ * lane at the same time. Rows go top to bottom in time order: a node sits below its parent and below the latest route
+ * node before it, on the first row where its connector and the connectors already drawn pass through no node.
+ * `row` and `lane` on a node override all of this. Every search is capped; if a spot cannot be found the node is
+ * placed anyway and the problem is reported in `warnings`.
  */
-export function layout(map, { share = true } = {}) {
+export function layout(map) {
   const nodes = map.nodes.map((n) => ({ ...n }));
   const by = Object.fromEntries(nodes.map((n) => [n.id, n]));
   const sorted = nodes.map((n, i) => ({ n, i, k: orderKey(map, n) })).sort((a, b) => a.k[0] - b.k[0] || a.k[1] - b.k[1] || a.k[2] - b.k[2] || a.i - b.i).map((o) => o.n);
-  // chronological, but a node always comes after its parent
-  const order = []; const placed = new Set(); let pending = sorted;
-  while (pending.length) {
-    const next = [];
-    for (const n of pending) { if (!n.parent || placed.has(n.parent)) { order.push(n); placed.add(n.id); } else next.push(n); }
-    if (next.length === pending.length) throw new Error('layout: parent cycle');
-    pending = next;
+  // chronological, but a node always comes after its parent: one that precedes its parent in time waits for it, then follows it directly
+  const order = []; const placed = new Set(); const waiting = new Map();
+  const emit = (n) => { order.push(n); placed.add(n.id); for (const c of waiting.get(n.id) || []) emit(c); waiting.delete(n.id); };
+  for (const n of sorted) {
+    if (!n.parent || placed.has(n.parent)) emit(n);
+    else { if (!waiting.has(n.parent)) waiting.set(n.parent, []); waiting.get(n.parent).push(n); }
   }
+  if (order.length !== nodes.length) throw new Error('layout: parent cycle');
   order.forEach((n, i) => { n.idx = i; });
-  // default parent for a non-route node with none: the latest route node before it
+
+  // tracks: a route child forks a new track; a side node's first child continues its track, later children fork new ones
   const tracks = [];
   for (const n of order) {
     if (n.route || !n.parent) { n.lane = 0; continue; }
     const p = by[n.parent];
-    if (p.route) { const t = { first: n, members: [n], fork: p, lane: null }; tracks.push(t); n.track = t; }
-    else { const t = p.track; t.members.push(n); n.track = t; }
+    if (!p.route && p.track && !p.cont) { p.cont = n; n.track = p.track; p.track.members.push(n); continue; }
+    const t = { first: n, members: [n], fork: p, lane: null }; tracks.push(t); n.track = t;
   }
+  // lanes, reserved up front for the span each track covers
   const occ = new Map();
-  const fits = (lane, t) => (occ.get(lane) || []).every(([s, e]) => !(t.s <= e && s <= t.e));
+  const laneFree = (lane, t) => (occ.get(lane) || []).every(([s, e]) => !(t.s <= e && s <= t.e));
   tracks.forEach((t, k) => {
-    t.s = t.fork.idx; t.e = Math.max(...t.members.map((m) => m.idx));
-    let lane = t.first.lane;
-    if (!Number.isInteger(lane) || lane === 0) {
-      const seq = []; for (let d = 1; d < 12; d++) seq.push(...(k % 2 === 0 ? [-d, d] : [d, -d]));
-      lane = seq.find((l) => fits(l, t));
-    }
-    t.lane = lane; if (!occ.has(lane)) occ.set(lane, []); occ.get(lane).push([t.s, t.e]);
-    for (const m of t.members) m.lane = lane;
+    t.s = t.first.idx; t.e = Math.max(...t.members.map((m) => m.idx));
+    const explicit = Number.isInteger(t.first.lane) && t.first.lane !== 0 ? t.first.lane : null;
+    const seq = []; for (let d = 1; d < 14; d++) seq.push(...(k % 2 === 0 ? [-d, d] : [d, -d]));
+    t.alt = seq.filter((l) => laneFree(l, t));
+    t.lane = explicit !== null ? explicit : t.alt[0];
+    if (!occ.has(t.lane)) occ.set(t.lane, []); occ.get(t.lane).push([t.s, t.e]);
+    for (const m of t.members) m.lane = t.lane;
   });
-  // outermost track on each side of a route node may share that node's row
-  const shareSet = new Set();
-  if (share) {
-    const groups = new Map();
-    for (const t of tracks) { const key = t.fork.id + (t.lane < 0 ? 'L' : 'R'); if (!groups.has(key) || Math.abs(t.lane) > Math.abs(groups.get(key).lane)) groups.set(key, t); }
-    for (const t of groups.values()) shareSet.add(t.first.id);
-  }
-  let row = -1;
-  const sharedAt = new Map();
-  for (const t of tracks) if (shareSet.has(t.first.id) && !Number.isInteger(t.first.row)) { if (!sharedAt.has(t.fork.id)) sharedAt.set(t.fork.id, []); sharedAt.get(t.fork.id).push(t.first); }
+
+  const cells = new Map();     // "r:lane" -> node
+  const hseg = [], vseg = [];  // connectors already drawn
+  const corners = new Set();   // where a connector bends: no node may sit there
+  const key = (r, l) => `${r}:${l}`;
+  const segsOf = (lane, p, r, mode) => {
+    const h = [], v = [];
+    if (mode === 'J') { // drop along the parent's lane first, then turn: for a route parent that is the route line itself
+      h.push({ row: r, a: Math.min(p.lane, lane), b: Math.max(p.lane, lane) });
+      if (!p.route) v.push({ lane: p.lane, a: p.r, b: r });
+      return { h, v };
+    }
+    if (p.lane === lane) v.push({ lane, a: p.r, b: r });
+    else { h.push({ row: p.r, a: Math.min(p.lane, lane), b: Math.max(p.lane, lane) }); if (r > p.r) v.push({ lane, a: p.r, b: r }); }
+    return { h, v };
+  };
+  const cornerOf = (p, r, lane, mode) => (mode === 'J' ? key(r, p.lane) : p.lane !== lane && r > p.r ? key(p.r, lane) : null);
+  const fits = (p, r, lane, mode) => {
+    if (cells.has(key(r, lane)) || corners.has(key(r, lane))) return false;
+    const cn = cornerOf(p, r, lane, mode);
+    if (cn && cells.has(cn)) return false;
+    const { h, v } = segsOf(lane, p, r, mode);
+    for (const sg of h) for (const y of cells.values()) if (y.r === sg.row && y.lane > sg.a && y.lane < sg.b) return false;
+    for (const sg of v) for (const y of cells.values()) if (y.lane === sg.lane && y.r > sg.a && y.r < sg.b) return false;
+    for (const sg of hseg) if (sg.row === r && lane > sg.a && lane < sg.b) return false;
+    for (const sg of vseg) if (sg.lane === lane && r > sg.a && r < sg.b) return false;
+    return true;
+  };
+  const put = (x, p, r, mode) => {
+    x.r = r; x.mode = mode || 'H'; cells.set(key(r, x.lane), x);
+    if (p) { const { h, v } = segsOf(x.lane, p, r, x.mode); hseg.push(...h); vseg.push(...v); const cn = cornerOf(p, r, x.lane, x.mode); if (cn) corners.add(cn); }
+  };
+  const CAP = 80;
+
+  let lastRoute = null;
   for (const n of order) {
-    if (Number.isInteger(n.row)) { n.r = n.row; row = Math.max(row, n.r); continue; }
-    if (n.r !== undefined) continue;
-    if (n.route || !n.parent) { n.r = ++row; for (const s of sharedAt.get(n.id) || []) s.r = n.r; continue; }
-    n.r = ++row;
+    const p = by[n.parent];
+    if (Number.isInteger(n.row)) { put(n, p, n.row); if (n.route) lastRoute = n; continue; }
+    if (n.route || !n.parent) {
+      let r = lastRoute ? lastRoute.r + 1 : 0; const r0 = r;
+      while (p && !fits(p, r, 0) && r < r0 + CAP) r++;
+      put(n, p, r); lastRoute = n; continue;
+    }
+    const lo = Math.max(p.r + 1, lastRoute ? lastRoute.r : 0);
+    const t = n.track;
+    let lanes;
+    if (t.first === n) lanes = [t.lane, ...t.alt.filter((l) => l !== t.lane).slice(0, 8)];
+    else { // a continued thread keeps its lane if it can, and may jog to a free one if something blocks it
+      const span = { s: n.idx, e: Math.max(...t.members.map((m) => m.idx)) };
+      const seq = []; for (let d = 1; d < 14; d++) seq.push(-d, d);
+      lanes = [n.lane, ...seq.filter((l) => l !== n.lane && laneFree(l, span)).slice(0, 8)];
+    }
+    // earliest row where any candidate lane works; the connector is tried both ways (turn then drop, drop then turn)
+    let chosen = null;
+    const modes = t.first === n ? ['H', 'J'] : ['H'];
+    for (let r = lo; r < lo + CAP && !chosen; r++) {
+      for (const lane of lanes) { for (const mode of modes) if (fits(p, r, lane, mode)) { chosen = { lane, r, mode }; break; } if (chosen) break; }
+    }
+    if (!chosen) { // keep looking down the first lane, then take the first free cell and let `warnings` say so
+      for (let r = lo; r < lo + CAP && !chosen; r++) if (fits(p, r, lanes[0], 'H')) chosen = { lane: lanes[0], r, mode: 'H' };
+      if (!chosen) { let r = lo; while (cells.has(key(r, lanes[0]))) r++; chosen = { lane: lanes[0], r, mode: 'H' }; }
+    }
+    if (chosen.lane !== n.lane) { // needed another lane: this node and the rest of its thread move there
+      if (t.first === n) t.lane = chosen.lane;
+      for (const m of t.members) if (m.idx >= n.idx) m.lane = chosen.lane;
+      if (!occ.has(chosen.lane)) occ.set(chosen.lane, []); occ.get(chosen.lane).push([n.idx, Math.max(...t.members.map((m) => m.idx))]);
+    }
+    put(n, p, chosen.r, chosen.mode);
   }
-  // compress unused rows
+
+  // compress unused rows, keeping order
   const used = [...new Set(nodes.map((n) => n.r))].sort((a, b) => a - b);
   const rm = new Map(used.map((r, i) => [r, i]));
   for (const n of nodes) n.r = rm.get(n.r);
-  // collisions
+  // verify: no connector passes through a node
   const warnings = [];
   for (const x of nodes) {
     const p = by[x.parent]; if (!p) continue;
+    if (x.mode === 'J') {
+      for (const y of nodes) {
+        if (y === x || y === p) continue;
+        if (y.r === x.r && Math.min(p.lane, x.lane) < y.lane && y.lane < Math.max(p.lane, x.lane)) warnings.push(`the branch to "${x.title}" passes through "${y.title}"`);
+        if (!p.route && y.lane === p.lane && p.r < y.r && y.r < x.r) warnings.push(`the branch to "${x.title}" passes through "${y.title}"`);
+      }
+      continue;
+    }
     if (p.lane !== x.lane) for (const y of nodes) {
       if (y === x || y === p) continue;
       if (y.r === p.r && Math.min(p.lane, x.lane) < y.lane && y.lane < Math.max(p.lane, x.lane)) warnings.push(`the branch to "${x.title}" passes through "${y.title}"`);
+      if (x.r > p.r && y.r === p.r && y.lane === x.lane) warnings.push(`the branch to "${x.title}" bends at "${y.title}"`);
     }
     for (const y of nodes) {
       if (y === x || y === p) continue;
       if (y.lane === x.lane && Math.min(p.r, x.r) < y.r && y.r < Math.max(p.r, x.r)) warnings.push(`the branch to "${x.title}" passes through "${y.title}"`);
     }
   }
-  const lanes = nodes.map((n) => n.lane);
-  return { nodes, by: Object.fromEntries(nodes.map((n) => [n.id, n])), rows: used.length, minLane: Math.min(0, ...lanes), maxLane: Math.max(0, ...lanes), warnings: [...new Set(warnings)] };
+  const cellSeen = new Set();
+  for (const n of nodes) { const k = key(n.r, n.lane); if (cellSeen.has(k)) warnings.push(`"${n.title}" is drawn on top of another node`); cellSeen.add(k); }
+  const lanesUsed = nodes.map((n) => n.lane);
+  return { nodes, by: Object.fromEntries(nodes.map((n) => [n.id, n])), rows: used.length, minLane: Math.min(0, ...lanesUsed), maxLane: Math.max(0, ...lanesUsed), warnings: [...new Set(warnings)] };
 }
 
 // ---------- restart briefs ----------
@@ -355,6 +425,7 @@ export function renderHtml(map, laid, sessions, verified, briefs) {
   // edges
   const edgePath = (p, c) => {
     const rp = p.route ? 14 : 10, rc = c.route ? 14 : 10, R = 14;
+    if (c.mode === 'J') { const s = c.x > p.x ? 1 : -1; return p.route ? `M${p.x} ${c.y} H${c.x - s * rc}` : `M${p.x} ${p.y + rp} V${c.y} H${c.x - s * rc}`; }
     if (c.y === p.y) { const s = c.x > p.x ? 1 : -1; return `M${p.x + s * rp} ${p.y} H${c.x - s * rc}`; }
     if (p.x === c.x) return `M${p.x} ${p.y + rp} V${c.y - rc}`;
     const s = c.x > p.x ? 1 : -1;
@@ -412,7 +483,7 @@ export function renderHtml(map, laid, sessions, verified, briefs) {
   const evSeen = {};
   for (const e of events) {
     const k = evSeen[e.after.id] = (evSeen[e.after.id] || 0) + 1;
-    const y = e.after.y + ROW_H / 2 + (k - 1) * 28, xg = W - 56;
+    const y = e.after.y + ROW_H / 2 + (k - 1) * 28, xg = W - 88;
     svg.push(`<g class="node evt" data-id="${esc(e.id)}" data-st="event" tabindex="0" role="button" aria-label="${esc(e.title)}"><circle cx="${xg}" cy="${y}" r="11" class="edot"/><text x="${xg}" y="${y + 4.5}" class="eg" text-anchor="middle">${e.kind === 'restart' ? '↻' : '!'}</text><circle cx="${xg}" cy="${y}" r="20" class="hit"/></g>`);
     tips[e.id] = { title: e.title, st: 'event', stl: 'Event', when: e.when, who: e.who, quote: e.quote, note: '', ok: e.ok, turn: e.turn, brief: 0 };
   }
@@ -673,8 +744,7 @@ async function main(argv) {
   if (!file) throw new Error(`usage: ${cmd} <map.json> ...`);
   const map = readMap(file);
   const keyed = await loadSessions(map, file);
-  let laid = layout(map);
-  if (laid.warnings.length) laid = layout(map, { share: false });
+  const laid = layout(map);
   const verified = verifyQuotes(map, keyed);
   const bad = map.nodes.filter((n) => !verified[n.id]);
   const report = () => {

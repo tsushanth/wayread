@@ -55,7 +55,7 @@ One folder per session, outside any repo: the session scratchpad directory if th
 4. **Build.** `node <script> build <folder>/map.json`. It validates the file, checks every quote, lays out the map, writes `map.html`, and records how far into the session you have read. Fix everything it reports:
    - "not found verbatim": go back to the cited turn and fix the quote or the turn number, or drop the node. Never loosen a quote just to make it pass.
    - validation errors: fix `map.json`.
-   - "layout" warnings: report them to the user; do not hand-edit `map.html`.
+   - "layout" warnings (a branch passes through or bends at another node): usually a branch hangs off a node far above it. Re-parent it onto the route node or the most recent node of that thread, or set `lane` (and, if needed, `row`) on the first node of that branch, then rebuild. If a warning remains, tell the user which branch. Do not hand-edit `map.html`.
 
 5. **Publish.** Publish `map.html` with the `Artifact` tool at the same file path every time (so the link stays the same), icon `map`, and a one-sentence description. The page already follows the Artifact page rules; don't edit it by hand. Report the URL, the counts for each status, how many quotes were found, and the titles of the open threads (parked, never pursued, open). Offer to restart any of them.
 

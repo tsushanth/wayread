@@ -105,24 +105,47 @@ test('the example lays out with no collisions: unique cells, route on lane 0, ro
   assert.deepEqual(route.map((n) => n.r), [...route.map((n) => n.r)].sort((a, b) => a - b));
 });
 
-test('layout holds up on a large random tree: no node on top of another, no branch through a node', () => {
-  let seed = 7; const rnd = () => (seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296;
-  for (let round = 0; round < 25; round++) {
-    const nodes = [N('r0', { route: true, src: 'H1' })];
-    const route = ['r0']; const side = [];
-    for (let i = 1; i < 45; i++) {
-      const roll = rnd();
-      if (roll < 0.3) { nodes.push(N(`r${i}`, { route: true, parent: route.at(-1), src: `H${i + 1}` })); route.push(`r${i}`); }
-      else if (roll < 0.65 || !side.length) { nodes.push(N(`s${i}`, { parent: route.at(-1 - Math.floor(rnd() * Math.min(2, route.length - 1))), status: 'rejected', src: `H${i + 1}` })); side.push(`s${i}`); }
-      else { const par = rnd() < 0.7 ? side.at(-1) : side[Math.floor(rnd() * side.length)]; nodes.push(N(`s${i}`, { parent: par, status: 'open', src: `H${i + 1}` })); side.push(`s${i}`); }
+function randomMap(seed0, { realistic }) {
+  let seed = seed0; const rnd = () => (seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296;
+  const nodes = [N('r0', { route: true, src: 'H1' })];
+  const route = ['r0']; const side = [];
+  for (let i = 1; i < 45; i++) {
+    const roll = rnd();
+    if (roll < 0.3) { nodes.push(N(`r${i}`, { route: true, parent: route.at(-1), src: `H${i + 1}` })); route.push(`r${i}`); }
+    else if (roll < 0.65 || !side.length) { nodes.push(N(`s${i}`, { parent: route.at(-1 - Math.floor(rnd() * Math.min(2, route.length - 1))), status: 'rejected', src: `H${i + 1}` })); side.push(`s${i}`); }
+    else {
+      // realistic: a thread continues, or something forks off a recent branch. adversarial: anything, however old.
+      const par = realistic ? side.at(-1 - Math.floor(rnd() * Math.min(3, side.length))) : (rnd() < 0.7 ? side.at(-1) : side[Math.floor(rnd() * side.length)]);
+      nodes.push(N(`s${i}`, { parent: par, status: 'open', src: `H${i + 1}` })); side.push(`s${i}`);
     }
-    const map = M(nodes);
+  }
+  return M(nodes);
+}
+
+test('layout of realistic trees (branches off the route, continued threads, forks off recent branches): unique cells always, and a warning only for the minority where no clean path exists', () => {
+  let warned = 0;
+  for (let round = 0; round < 200; round++) {
+    const map = randomMap(round + 1, { realistic: true });
     assert.deepEqual(validate(map), []);
-    let l = layout(map); if (l.warnings.length) l = layout(map, { share: false });
+    const l = layout(map);
+    const cells = l.nodes.map((n) => `${n.r}:${n.lane}`);
+    assert.equal(new Set(cells).size, cells.length, `round ${round}: two nodes share a cell`);
+    if (l.warnings.length) warned++;
+  }
+  assert.ok(warned <= 40, `${warned} of 200 realistic maps needed a warning`); // measured: about 28 of 200 (14%)
+});
+
+test('layout of adversarial trees (forks off branches from anywhere earlier) always finishes with unique cells, and reports what it could not avoid', () => {
+  let warned = 0;
+  for (let round = 0; round < 100; round++) {
+    const map = randomMap(1000 + round, { realistic: false });
+    const l = layout(map);
     const cells = l.nodes.map((n) => `${n.r}:${n.lane}`);
     assert.equal(new Set(cells).size, cells.length, `round ${round}: two nodes share a cell`);
     for (const n of l.nodes) assert.ok(n.r >= 0 && Number.isInteger(n.lane));
+    if (l.warnings.length) warned++;
   }
+  assert.ok(warned <= 40, `${warned} of 100 adversarial maps needed a warning`); // measured: about 21%
 });
 
 test('explicit row and lane on a node are respected', () => {
