@@ -29,6 +29,8 @@ Note: individual file edits during the implementation step are separately gated 
 
 State clearly which step the flow actually reached and why. Don't imply the feature is fully built, reviewed, and guardrail-clean if any step was skipped or stopped early — be specific about what's actually done versus what's still open. If a live plan was running, publish it a last time, give its URL, and list the flags it shows (unplanned files, shared files, missing results) as open or resolved.
 
+If any commits landed this run, check they're not about to be stranded: run `node <script> scan --no-fetch --quiet` on the current repo, per `/wayread:unpushed-work`, and report anything found. If `node` isn't available, say so and skip this.
+
 ## When to use this
 
 When you have a concrete requirement to implement and want the full plan → build → review → coverage → guardrails flow to happen without manually invoking each command, while still approving the plan before code gets written and reviewing findings before they're silently fixed.

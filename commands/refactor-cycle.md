@@ -30,6 +30,8 @@ Note: individual file edits during the implementation step are separately gated 
 
 State clearly which step the flow actually reached. End with an explicit statement of whether the evidence gathered (tests, coverage, review) actually supports "behavior is unchanged," or whether that claim is still unproven — don't let a completed flow imply behavioral equivalence was verified if it wasn't. If a live plan was running, publish it a last time, give its URL, and list the flags it shows as open or resolved.
 
+If any commits landed this run, check they're not about to be stranded: run `node <script> scan --no-fetch --quiet` on the current repo, per `/wayread:unpushed-work`, and report anything found. If `node` isn't available, say so and skip this.
+
 ## When to use this
 
 When you're restructuring code without adding a capability or changing what it does, and want the plan → build → review → coverage → guardrails flow to happen without manually invoking each command, with coverage treated as proof of behavioral equivalence rather than routine test hygiene. For adding a new capability instead, use `/wayread:new-feature-cycle`.

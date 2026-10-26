@@ -53,6 +53,7 @@ Use this when you have a specific requirement to implement.
 | `/wayread:trace` | Trace ONE use case through the code ("a caller asks for a person") and publish a walkthrough: numbered steps, sequence diagram, key code by function name, optional live proof (`live`), and what to say when someone asks to see it. Use when you need to show or explain how something works, including code AI wrote. |
 | `/wayread:live-plan` | Shows a task's plan as a graph (steps, the files each touches, what waits on what) and compares it with what git says changed. Published as an Artifact and updated at each step boundary. Needs Node 18+. Runs automatically inside `/wayread:new-feature-cycle` and `/wayread:refactor-cycle`. |
 | `/wayread:session-map` | Reads a long Claude Code conversation and draws a route map of its decisions: green for decided, red for ruled out, amber for parked, a dotted ring for options nobody picked up, purple for open questions. Every node has a quote that is checked against the transcript. `update` adds what happened since; `resume` restarts the missed threads in parallel, after you confirm. The page can also copy a restart brief for any thread. Needs Node 18+. |
+| `/wayread:unpushed-work` | Finds git work that exists only on this machine — branches ahead of their remote, stash entries, commits orphaned by a reset or a dropped stash — in one repo or swept across every repo under a folder. Never pushes anything itself; reports and asks. `catch-up`, `ship-check`, `fix-repo-cycle`, `new-feature-cycle` and `refactor-cycle` already run a quick version of it at the end of their own flow. Needs Node 18+. |
 | `/wayread:runbook` | The entry point when you're not sure which command fits — maps an intent (new feature, fix bugs, orient, ship-readiness, refactor, catch up) to the right command, and can run it for you after confirming. |
 
 ## Quick decision
@@ -63,6 +64,7 @@ Use this when you have a specific requirement to implement.
 - **"Show me how X happens in the code."** → `/wayread:trace "X"` (add `live` to prove it on a test call)
 - **"Let me watch what this change is doing."** → `/wayread:live-plan "X"`
 - **"Where did this long conversation go, and what did we drop?"** → `/wayread:session-map latest`
+- **"Did I push everything? What's stuck on this laptop?"** → `/wayread:unpushed-work` (or `sweep <root>` for every repo)
 - **"Give me everything on this diff, once."** → `/wayread:change-full-review`
 - **"I just want to understand this codebase, not change it."** → `/wayread:orient`
 - **"Can this ship?"** → `/wayread:ship-check`

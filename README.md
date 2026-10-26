@@ -14,6 +14,7 @@ Commands are namespaced `/wayread:<name>`. Run `/wayread:help` for the list, or 
 | Build or refactor with review gates | `/wayread:explain-approach`, `/wayread:new-feature-cycle`, `/wayread:refactor-cycle` |
 | See where a long conversation went, and restart what fell off | `/wayread:session-map latest` (a route map of the decisions, with branches for what was ruled out, parked, never pursued or left open; every node has a checked quote; copy a restart brief for any thread) |
 | Watch a multi-step change as it happens | `/wayread:live-plan "add rate limiting to login"` (plan graph, files touched, plan checked against git; also runs inside `new-feature-cycle` and `refactor-cycle`) |
+| Find work that only exists on this machine | `/wayread:unpushed-work` (unpushed branches, stash entries, orphaned commits; `sweep <root>` for every repo under a folder; several other commands already run a quick version of this at the end of their own flow) |
 | Review a change | `/wayread:code-review`, `/wayread:coverage`, `/wayread:guardrails`, `/wayread:explain-code-change`, `/wayread:catch-up`, `/wayread:change-full-review` |
 | Release gate | `/wayread:ship-check` |
 | Pick for me | `/wayread:runbook` |
@@ -34,7 +35,8 @@ These commands are thin workflows around what Claude Code already has, not repla
 - Missing a built-in on your setup? The command says so and carries on without it.
 
 ## Things to know
-- These are prompts, not programs, with two exceptions: `/wayread:live-plan` and `/wayread:session-map` do their rendering and checking in `scripts/live-plan.mjs` and `scripts/session-map.mjs`, scripts with no dependencies that need Node 18+ (live-plan also needs git). `node --test scripts/` runs their tests. Results depend on your model and your repo, and any finding should be checked against the code before you act on it.
+- These are prompts, not programs, with three exceptions: `/wayread:live-plan`, `/wayread:session-map` and `/wayread:unpushed-work` do their rendering and checking in `scripts/live-plan.mjs`, `scripts/session-map.mjs` and `scripts/unpushed-work.mjs`, scripts with no dependencies that need Node 18+ and git. `node --test scripts/` runs their tests. Results depend on your model and your repo, and any finding should be checked against the code before you act on it.
+- `/wayread:unpushed-work` only reports; it never pushes, drops a stash, or runs `git gc`. Whether to push a given branch is your call.
 - The plan graph changes only when it is republished, and step status is the model's own report. Only the plan-against-git file comparison comes from git.
 - A session map is a model's reading of a conversation. Statuses are judgement calls; the quotes are checked against the transcript. Claude Code deletes session files after 30 days by default, and their format is internal and can change.
 - Several commands publish Claude Artifacts and some can edit files or run tests in your repo when you ask them to. Read a command's file in `commands/` before running it on a repo you care about.

@@ -46,6 +46,8 @@ Skips the parts of the flow that exist to *find out* what's wrong, since that's 
 
 State clearly which mode ran, which step the flow actually reached, and why (completed fully, stopped at your request, stopped because a step found nothing to act on, or stopped because a targeted issue didn't confirm). Don't imply the full flow ran if it didn't, and don't let "targeted mode" read as a lesser or incomplete run — it's a deliberate scope choice, not a shortcut that skipped verification.
 
+If `/wayread:harden` landed any fixes this run, check they're not about to be stranded: run `node <script> scan --no-fetch --quiet` on the current repo, per `/wayread:unpushed-work`, and report anything found. If `node` isn't available, say so and skip this.
+
 ## When to use this
 
 When you want the audit-and-harden flow to happen without manually invoking each command yourself, but still want to see and approve each stage's findings before the next stage acts on them. Use it with no argument when you don't know what's wrong yet; use it with a specific known issue when you do and want to skip straight to a scoped, verified fix. If you want zero pauses and full autonomy instead, don't use this command — invoke `/wayread:harden` directly in a loop yourself, understanding that skips the review checkpoints this flow is built around.

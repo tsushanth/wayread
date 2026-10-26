@@ -13,9 +13,11 @@ Parse `$ARGUMENTS`: if it contains "review" (in any phrasing — "and review it"
 
 1. **Run `/wayread:explain-code-change [remaining arguments]`.** Report its output — the plain-language explanation of what changed in the git working tree (uncommitted, vs HEAD).
 
-2. **If "review" was requested: run `/wayread:code-review`** (current diff, at the level last used or `medium` if none specified) against the same working-tree changes. Report findings.
+2. **Also check for unpushed work**, per `/wayread:unpushed-work`: run `node <script> scan --no-fetch --quiet` on the current repo (`--no-fetch` because this is a quick local check, not a full audit). Report anything found — branches ahead of their remote, stash entries, orphaned commits — alongside the explanation. "Catching up" should include noticing that some of the work is sitting only on this machine, not just what it contains. If `node` isn't available, say so and skip this step.
 
-3. **If "review" was not requested:** stop after step 1. Don't run a review the user didn't ask for — ask them to `/wayread:catch-up review` (or `/wayread:code-review` directly) if they decide they want one after reading the explanation.
+3. **If "review" was requested: run `/wayread:code-review`** (current diff, at the level last used or `medium` if none specified) against the same working-tree changes. Report findings.
+
+4. **If "review" was not requested:** stop after step 2. Don't run a review the user didn't ask for — ask them to `/wayread:catch-up review` (or `/wayread:code-review` directly) if they decide they want one after reading the explanation.
 
 ## After the flow completes
 
