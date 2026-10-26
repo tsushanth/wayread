@@ -1,0 +1,29 @@
+{
+  "task": "Add rate limiting to the login endpoint",
+  "title": "Login rate limit",
+  "rule": "Changes stay inside src/auth and its tests. Nothing under migrations/ changes.",
+  "stages": ["Prepare", "Build", "Verify"],
+  "steps": [
+    {
+      "id": "read", "stage": 0, "title": "Read the login handler and the existing middleware", "short": "Read code", "status": "pending",
+      "reads": ["src/auth/login.ts", "src/auth/middleware.ts"]
+    },
+    {
+      "id": "limiter", "stage": 1, "title": "Add a sliding-window limiter", "short": "Limiter", "status": "pending",
+      "writes": ["src/auth/rateLimiter.ts", "test/auth/rateLimiter.test.ts"], "needs": ["read"],
+      "note": "In-memory store behind a small interface so it can move to Redis later."
+    },
+    {
+      "id": "wire", "stage": 1, "title": "Apply the limiter in the login handler", "short": "Wire in", "status": "pending",
+      "writes": ["src/auth/login.ts", "test/auth/login.test.ts"], "needs": ["limiter"]
+    },
+    {
+      "id": "config", "stage": 1, "title": "Read the limits from config with safe defaults", "short": "Config", "status": "pending",
+      "writes": ["src/config/auth.ts"], "needs": ["read"]
+    },
+    {
+      "id": "e2e", "stage": 2, "title": "End-to-end check: the sixth bad login in a minute is refused", "short": "E2E check", "status": "pending",
+      "needs": ["wire", "config"], "needsEvidence": true
+    }
+  ]
+}
