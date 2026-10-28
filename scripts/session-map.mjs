@@ -347,8 +347,11 @@ const DEFAULT_RULES = [
   'Report what you tried, the result with evidence, and a recommendation. Say what you could not verify.',
 ];
 
-export function makeBrief(map, laid, sessions, id) {
+// One thread's brief in pieces, so a bundle can print the constraints and rules once instead of once per thread.
+// opts.compact: shorter excerpts and only the last 3 route steps (used when many threads share one paste).
+export function makeBriefParts(map, laid, sessions, id, opts = {}) {
   const n = laid.by[id]; if (!n) throw new Error(`no node ${JSON.stringify(id)}`);
+  const compact = !!opts.compact;
   const t = turnFor(map, sessions, n.src);
   const s = parseSrc(n.src);
   const who = s.role === 'H' ? 'You said' : 'Claude said';
@@ -364,33 +367,74 @@ export function makeBrief(map, laid, sessions, id) {
   if (t) {
     const p = sessions[t.sid], turn = t.turn;
     if (s.role === 'A') {
-      ex.push(`- Claude (${ref(t.sid, 'A', t.n)}): "${around(turn.assistant, n.quote, 330)}"`);
+      ex.push(`- Claude (${ref(t.sid, 'A', t.n)}): "${around(turn.assistant, n.quote, compact ? 240 : 330)}"`);
       const next = p.turns[t.n];
-      if (next && next.kind !== 'summary') ex.push(`- You, next (${ref(t.sid, 'H', t.n + 1)}): "${clip(next.human, 450)}"`);
+      if (next && next.kind !== 'summary') ex.push(`- You, next (${ref(t.sid, 'H', t.n + 1)}): "${clip(next.human, compact ? 320 : 450)}"`);
     } else {
-      ex.push(`- You (${ref(t.sid, 'H', t.n)}): "${clip(turn.human, 520)}"`);
-      if (turn.assistant) ex.push(`- Claude's reply (${ref(t.sid, 'A', t.n)}): "${clip(turn.assistant, 450)}"`);
+      ex.push(`- You (${ref(t.sid, 'H', t.n)}): "${clip(turn.human, compact ? 380 : 520)}"`);
+      if (turn.assistant) ex.push(`- Claude's reply (${ref(t.sid, 'A', t.n)}): "${clip(turn.assistant, compact ? 320 : 450)}"`);
     }
   }
-  const before = laid.nodes.filter((m) => m.route && !m.constraint && m.status !== 'now' && m.idx < n.idx).slice(-6).map((m) => `- ${m.title}${m.note ? ': ' + m.note : ''}`);
-  const constraints = laid.nodes.filter((m) => m.constraint && m.status === 'decided').map((m) => `- ${m.title}${m.note ? ': ' + m.note : ''}`);
-  return [
+  const routeCount = compact ? 3 : 6;
+  const line = (m) => `- ${m.title}${m.note ? ': ' + (compact ? clip(m.note, 110) : m.note) : ''}`;
+  const before = laid.nodes.filter((m) => m.route && !m.constraint && m.status !== 'now' && m.idx < n.idx).slice(-routeCount).map(line);
+  const constraints = laid.nodes.filter((m) => m.constraint && m.status === 'decided').map(line);
+  const rules = (map.briefRules || DEFAULT_RULES).map((r) => '- ' + r);
+  const head = [
     `RESTART THIS THREAD: ${n.title}`,
     `Status in the session map: ${LABEL[n.status]}${t ? ' (' + fmtTime(t.turn.ts) + ')' : ''}`,
     `${who}${t ? ' in turn ' + ref(t.sid, s.role, s.n) : ''}: "${n.quote}"`,
     n.note ? `What happened to it: ${n.note}` : null,
     ex.length ? `\nWhere it came up:\n${ex.join('\n')}` : null,
     before.length ? `\nThe route so far (most recent decisions before this point):\n${before.join('\n')}` : null,
-    constraints.length ? `\nStanding constraints:\n${constraints.join('\n')}` : null,
-    `\nHow to work this thread:\n${(map.briefRules || DEFAULT_RULES).map((r) => '- ' + r).join('\n')}`,
+  ].filter((x) => x !== null);
+  return { head, constraints, rules };
+}
+
+export function makeBrief(map, laid, sessions, id) {
+  const p = makeBriefParts(map, laid, sessions, id);
+  return [
+    ...p.head,
+    p.constraints.length ? `\nStanding constraints:\n${p.constraints.join('\n')}` : null,
+    `\nHow to work this thread:\n${p.rules.join('\n')}`,
   ].filter((x) => x !== null).join('\n');
+}
+
+// Many threads in as few pastes as possible. A chat box cuts a paste at about 50,000 characters, so each part stays under
+// maxChars (default 40,000). The standing constraints and the working rules are printed once per part, not once per thread.
+export function makeBundles(map, laid, sessions, ids, maxChars = 40000) {
+  if (!ids.length) return [];
+  const first = makeBriefParts(map, laid, sessions, ids[0], { compact: true });
+  const { constraints, rules } = first;
+  const pre = (i, k, cnt) => [
+    `RESTART THESE THREADS (part ${i} of ${k}, ${cnt} thread${cnt === 1 ? '' : 's'} in this part). Each block below is one thread from a session map.`,
+    constraints.length ? `\nStanding constraints (apply to every thread):\n${constraints.join('\n')}` : null,
+    `\nHow to work each thread:\n${rules.join('\n')}`,
+    '\nThe threads:',
+  ].filter((x) => x !== null).join('\n');
+  const SEP = '\n\n----------\n\n';
+  const reserve = pre(99, 99, 99).length + 40;
+  const room = Math.max(2000, maxChars - reserve - SEP.length);
+  const blocks = ids.map((id) => {
+    let text = makeBriefParts(map, laid, sessions, id, { compact: true }).head.join('\n').replace(/^RESTART THIS THREAD: /, 'THREAD: ');
+    if (text.length > room) text = text.slice(0, room).trimEnd() + '\n[brief cut to fit one paste]';
+    return { id, text };
+  });
+  const parts = []; let cur = [], len = reserve;
+  for (const b of blocks) {
+    const add = b.text.length + SEP.length;
+    if (cur.length && len + add > maxChars) { parts.push(cur); cur = []; len = reserve; }
+    cur.push(b); len += add;
+  }
+  if (cur.length) parts.push(cur);
+  return parts.map((pt, i) => ({ ids: pt.map((b) => b.id), text: pre(i + 1, parts.length, pt.length) + '\n\n' + pt.map((b) => b.text).join(SEP) + '\n' }));
 }
 
 // ---------- page ----------
 
 const wrapText = (t, w) => { const out = []; let line = ''; for (const word of String(t).split(/\s+/)) { if (line && (line + ' ' + word).length > w) { out.push(line); line = word; } else line = line ? line + ' ' + word : word; } if (line) out.push(line); return out.length ? out : ['']; };
 
-export function renderHtml(map, laid, sessions, verified, briefs) {
+export function renderHtml(map, laid, sessions, verified, briefs, bundles = []) {
   const { nodes, by } = laid;
   const SP = 250, ROW_H = 92, TOP = 78, LEFT = 120, RIGHT = 190;
   const X0 = LEFT + (-laid.minLane) * SP + 60;
@@ -514,7 +558,7 @@ export function renderHtml(map, laid, sessions, verified, briefs) {
     </div>
     <div class="facts"><span><b>${days.size}</b> day${days.size === 1 ? '' : 's'}</span><span><b>${prompts}</b> of your prompts</span><span><b>${comps}</b> context compaction${comps === 1 ? '' : 's'}</span><span><b>${nodes.length}</b> choices mapped</span></div>
   </header>
-  <div class="legend" role="group" aria-label="Filter by status">${chips}<button class="chip clear" data-filter="" hidden>Show all</button>${openCount ? `<button class="chip copyall" id="copyall"><b>Copy ${openCount} open thread${openCount === 1 ? '' : 's'} to restart</b></button>` : ''}</div>
+  <div class="legend" role="group" aria-label="Filter by status">${chips}<button class="chip clear" data-filter="" hidden>Show all</button>${openCount ? `<span class="copygroup">${(bundles.length > 1 ? bundles.map((b, i, all) => { const a = all.slice(0, i).reduce((x, y) => x + y.ids.length, 0) + 1; return `<button class="chip copyall" data-part="${i}"><b>Copy threads ${a}-${a + b.ids.length - 1} (part ${i + 1} of ${all.length})</b></button>`; }) : [`<button class="chip copyall" data-part="0"><b>Copy ${openCount} open thread${openCount === 1 ? '' : 's'} to restart</b></button>`]).join('')}</span>` : ''}</div>
   <div class="mapwrap" id="mapwrap"><svg id="map" viewBox="0 0 ${W} ${HEIGHT}" style="min-width:${Math.min(W, 900)}px" role="img" aria-label="Decision map of the conversation, newest at the bottom">
     ${svg.join('')}
   </svg></div>
@@ -523,6 +567,7 @@ export function renderHtml(map, laid, sessions, verified, briefs) {
 <div id="tip" role="tooltip" hidden></div>
 <script type="application/json" id="tips">${JSON.stringify(tips).replace(/</g, '\\u003c').replace(new RegExp('\\u2028', 'g'), '\\u2028').replace(new RegExp('\\u2029', 'g'), '\\u2029')}</script>
 <script type="application/json" id="briefs">${JSON.stringify(briefs).replace(/</g, '\\u003c').replace(new RegExp('\\u2028', 'g'), '\\u2028').replace(new RegExp('\\u2029', 'g'), '\\u2029')}</script>
+<script type="application/json" id="bundles">${JSON.stringify(bundles).replace(/</g, '\\u003c').replace(new RegExp('\\u2028', 'g'), '\\u2028').replace(new RegExp('\\u2029', 'g'), '\\u2029')}</script>
 <script>${CLIENT_JS}</script>`;
 }
 
@@ -553,7 +598,8 @@ h4,p{margin:0}
 .chip b{font-variant-numeric:tabular-nums}
 .chip[aria-pressed="true"]{border-color:var(--c);box-shadow:0 0 0 1px var(--c)}
 .chip.clear{border-style:dashed;color:var(--muted);padding-left:12px}
-.chip.copyall{margin-left:auto;padding-left:14px;border-color:var(--accent);color:var(--accent)}
+.copygroup{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
+.chip.copyall{padding-left:14px;border-color:var(--accent);color:var(--accent)}
 .chip.copyall b{font-weight:600}
 .chip:focus-visible,.node:focus-visible,.tipbtn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .st-decided{--c:var(--ok)}.st-rejected{--c:var(--bad)}.st-deferred{--c:var(--warn)}.st-unexplored{--c:var(--muted)}.st-open{--c:var(--open)}.st-now{--c:var(--accent)}
@@ -675,11 +721,13 @@ const CLIENT_JS = `
   }
   chips.forEach(function (c) { c.addEventListener('click', function () { var f = c.getAttribute('data-filter'); if (c === clear || c.getAttribute('aria-pressed') === 'true') setFilter(''); else setFilter(f); }); });
 
-  var all = document.getElementById('copyall');
-  if (all) all.addEventListener('click', function () {
-    var ids = Object.keys(briefs).filter(function (id) { var t = tips[id]; return t && (t.st === 'unexplored' || t.st === 'open' || t.st === 'deferred'); });
-    var label = all.textContent;
-    copyText(ids.map(function (id) { return briefs[id]; }).join('\\n\\n==========\\n\\n'), all.querySelector('b') || all, all.querySelector('b') ? all.querySelector('b').textContent : label);
+  var bundles = JSON.parse(document.getElementById('bundles').textContent);
+  Array.prototype.slice.call(document.querySelectorAll('.copyall')).forEach(function (btn) {
+    var lab = btn.querySelector('b') || btn, label = lab.textContent;
+    btn.addEventListener('click', function () {
+      var part = bundles[Number(btn.getAttribute('data-part')) || 0];
+      if (part) copyText(part.text, lab, label);
+    });
   });
 })();
 `;
@@ -758,8 +806,9 @@ async function main(argv) {
   if (cmd === 'build') {
     const briefs = {};
     for (const n of laid.nodes) if (RESTARTABLE.includes(n.status)) briefs[n.id] = makeBrief(map, laid, keyed, n.id);
+    const bundles = makeBundles(map, laid, keyed, laid.nodes.filter((n) => OPEN_THREADS.includes(n.status)).map((n) => n.id));
     const out = path.join(path.dirname(path.resolve(file)), 'map.html');
-    fs.writeFileSync(out, renderHtml(map, laid, keyed, verified, briefs));
+    fs.writeFileSync(out, renderHtml(map, laid, keyed, verified, briefs, bundles));
     if (map.pending) { map.cursor = { ...(map.cursor || {}), ...map.pending }; delete map.pending; } else { map.cursor = map.cursor || {}; for (const s of map.sessions) map.cursor[s.id] = keyed[s.id].turns.length; }
     writeMap(file, map);
     console.log(`built ${out}`); report();
@@ -767,14 +816,22 @@ async function main(argv) {
   }
   if (cmd === 'brief') {
     const outDir = flag(rest, '--out');
+    const maxChars = Number(flag(rest, '--max-chars', 40000)) || 40000;
     const sel = which === 'open' ? laid.nodes.filter((n) => OPEN_THREADS.includes(n.status)).map((n) => n.id) : String(which || '').split(',').filter(Boolean);
-    if (!sel.length) throw new Error('usage: brief <map.json> <id[,id...]|open> [--out DIR]');
+    if (!sel.length) throw new Error('usage: brief <map.json> <id[,id...]|open> [--out DIR] [--max-chars N]');
     if (outDir) fs.mkdirSync(outDir, { recursive: true });
-    for (const id of sel) {
-      const text = makeBrief(map, laid, keyed, id);
-      if (outDir) { fs.writeFileSync(path.join(outDir, `brief-${id}.md`), text + '\n'); console.log(`wrote ${path.join(outDir, `brief-${id}.md`)}  (${laid.by[id].title})`); }
-      else console.log(text + '\n\n==========\n');
+    if (outDir) for (const id of sel) {
+      fs.writeFileSync(path.join(outDir, `brief-${id}.md`), makeBrief(map, laid, keyed, id) + '\n');
+      console.log(`wrote ${path.join(outDir, `brief-${id}.md`)}  (${laid.by[id].title})`);
     }
+    if (sel.length > 1) {
+      // Several threads: also write them as pastes that fit a chat box (constraints and rules once per part).
+      const bundles = makeBundles(map, laid, keyed, sel, maxChars);
+      bundles.forEach((b, i) => {
+        if (outDir) { const f = path.join(outDir, `restart-part-${i + 1}.md`); fs.writeFileSync(f, b.text); console.log(`wrote ${f}  (${b.ids.length} threads, ${b.text.length} characters)`); }
+        else console.log(b.text + (i < bundles.length - 1 ? '\n==========\n' : ''));
+      });
+    } else if (!outDir) console.log(makeBrief(map, laid, keyed, sel[0]) + '\n');
     return 0;
   }
   throw new Error(`unknown command ${JSON.stringify(cmd)}`);
