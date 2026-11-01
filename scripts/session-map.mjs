@@ -20,8 +20,8 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
-export const STATUSES = ['decided', 'rejected', 'deferred', 'unexplored', 'open', 'now'];
-export const LABEL = { decided: 'Decided', rejected: 'Ruled out', deferred: 'Parked', unexplored: 'Never pursued', open: 'Open question', now: 'You are here' };
+export const STATUSES = ['decided', 'rejected', 'deferred', 'unexplored', 'open', 'now', 'suggested'];
+export const LABEL = { decided: 'Decided', rejected: 'Ruled out', deferred: 'Parked', unexplored: 'Never pursued', open: 'Open question', now: 'You are here', suggested: 'Suggested' };
 const RESTARTABLE = ['rejected', 'deferred', 'unexplored', 'open'];
 const OPEN_THREADS = ['deferred', 'unexplored', 'open'];
 const SRC_RE = /^(?:([A-Za-z0-9_-]+):)?([HA])(\d+)$/;
@@ -145,10 +145,20 @@ export function validate(map) {
     ids.add(n.id);
     if (!STATUSES.includes(n.status)) errs.push(`${at}: status must be one of ${STATUSES.join(', ')}`);
     if (typeof n.title !== 'string' || !n.title.trim()) errs.push(`${at}: title is required`);
-    if (typeof n.quote !== 'string' || !n.quote.trim()) errs.push(`${at}: quote is required (a verbatim quote from the cited turn)`);
-    const s = parseSrc(n.src);
-    if (!s) errs.push(`${at}: src must look like H12 or A12 (or sessionid:H12 when there are several sessions)`);
-    else if (multi && !s.sid) errs.push(`${at}: src needs a session prefix (sessionid:${n.src}) because the map has several sessions`);
+    if (n.status === 'suggested') {
+      // a suggestion is not from the transcript: it cites papers instead of a quote, and hangs off a node it extends
+      if (n.route) errs.push(`${at}: a suggested node cannot be on the route`);
+      if (!['branch', 'direction'].includes(n.kind)) errs.push(`${at}: kind must be "branch" or "direction"`);
+      else if (n.kind === 'branch' && !n.parent) errs.push(`${at}: a suggested branch needs a parent (the node it extends)`);
+      else if (n.kind === 'direction' && n.parent) errs.push(`${at}: a suggested direction is not on the tree, so it has no parent (give it a parent and kind "branch" if it extends a node)`);
+      if (!Array.isArray(n.evidence) || !n.evidence.length) errs.push(`${at}: evidence needs at least one { title, id, url } paper`);
+      else for (const e of n.evidence) if (!e || typeof e.title !== 'string' || !e.title.trim() || !(e.url || e.id)) errs.push(`${at}: every evidence entry needs a title and an id or url`);
+    } else {
+      if (typeof n.quote !== 'string' || !n.quote.trim()) errs.push(`${at}: quote is required (a verbatim quote from the cited turn)`);
+      const s = parseSrc(n.src);
+      if (!s) errs.push(`${at}: src must look like H12 or A12 (or sessionid:H12 when there are several sessions)`);
+      else if (multi && !s.sid) errs.push(`${at}: src needs a session prefix (sessionid:${n.src}) because the map has several sessions`);
+    }
     if (n.route && !n.parent) roots++;
     for (const k of ['row', 'lane']) if (n[k] !== undefined && !Number.isInteger(n[k])) errs.push(`${at}: ${k} must be an integer`);
   }
@@ -156,7 +166,7 @@ export function validate(map) {
     if (!n || !ids.has(n.id)) continue;
     if (n.parent && !ids.has(n.parent)) errs.push(`node ${JSON.stringify(n.id)}: parent ${JSON.stringify(n.parent)} does not exist`);
     if (n.parent === n.id) errs.push(`node ${JSON.stringify(n.id)}: parent is itself`);
-    if (!n.parent && !n.route) errs.push(`node ${JSON.stringify(n.id)}: a node with no parent must be a route node`);
+    if (!n.parent && !n.route && n.status !== 'suggested') errs.push(`node ${JSON.stringify(n.id)}: a node with no parent must be a route node`);
   }
   if (roots !== 1) errs.push(`exactly one route node must have no parent (found ${roots}): that is where the conversation started`);
   if (!errs.length) { // cycles
@@ -179,6 +189,7 @@ function turnFor(map, sessions, srcStr) {
 export function verifyQuotes(map, sessions) {
   const out = {};
   for (const n of map.nodes) {
+    if (n.status === 'suggested') continue; // nothing to check: it is not a claim about the transcript
     const t = turnFor(map, sessions, n.src);
     const text = t ? (t.role === 'H' ? t.turn.human : t.turn.assistant) : '';
     out[n.id] = !!t && norm(n.quote).length > 0 && text.includes(norm(n.quote));
@@ -188,7 +199,12 @@ export function verifyQuotes(map, sessions) {
 
 // ---------- layout ----------
 
-const orderKey = (map, n) => {
+const orderKey = (map, n, depth = 0) => {
+  if (n.status === 'suggested') { // no turn of its own: sorts right after the node it extends
+    const p = map.nodes.find((x) => x.id === n.parent);
+    const k = p && depth < 20 ? orderKey(map, p, depth + 1) : [0, 0, 0];
+    return [k[0], k[1], 2];
+  }
   const s = parseSrc(n.src) || { sid: null, n: 0, role: 'H' };
   const si = Math.max(0, map.sessions.findIndex((x) => s.sid && (x.id.startsWith(s.sid) || s.sid.startsWith(x.id))));
   return [si, s.n, s.role === 'H' ? 0 : 1];
@@ -204,9 +220,11 @@ const orderKey = (map, n) => {
  * placed anyway and the problem is reported in `warnings`.
  */
 export function layout(map) {
-  const nodes = map.nodes.map((n) => ({ ...n }));
+  // a suggested "direction" has no parent: it is not on the tree, so it is kept out of the layout and drawn in its own band
+  const loose = map.nodes.filter((n) => n.status === 'suggested' && !n.parent).map((n) => ({ ...n }));
+  const nodes = map.nodes.filter((n) => !(n.status === 'suggested' && !n.parent)).map((n) => ({ ...n }));
   const by = Object.fromEntries(nodes.map((n) => [n.id, n]));
-  const sorted = nodes.map((n, i) => ({ n, i, k: orderKey(map, n) })).sort((a, b) => a.k[0] - b.k[0] || a.k[1] - b.k[1] || a.k[2] - b.k[2] || a.i - b.i).map((o) => o.n);
+  const sorted =nodes.map((n, i) => ({ n, i, k: orderKey(map, n) })).sort((a, b) => a.k[0] - b.k[0] || a.k[1] - b.k[1] || a.k[2] - b.k[2] || a.i - b.i).map((o) => o.n);
   // chronological, but a node always comes after its parent: one that precedes its parent in time waits for it, then follows it directly
   const order = []; const placed = new Set(); const waiting = new Map();
   const emit = (n) => { order.push(n); placed.add(n.id); for (const c of waiting.get(n.id) || []) emit(c); waiting.delete(n.id); };
@@ -336,7 +354,7 @@ export function layout(map) {
   const cellSeen = new Set();
   for (const n of nodes) { const k = key(n.r, n.lane); if (cellSeen.has(k)) warnings.push(`"${n.title}" is drawn on top of another node`); cellSeen.add(k); }
   const lanesUsed = nodes.map((n) => n.lane);
-  return { nodes, by: Object.fromEntries(nodes.map((n) => [n.id, n])), rows: used.length, minLane: Math.min(0, ...lanesUsed), maxLane: Math.max(0, ...lanesUsed), warnings: [...new Set(warnings)] };
+  return { nodes, loose, by: Object.fromEntries([...nodes, ...loose].map((n) => [n.id, n])), rows: used.length, minLane: Math.min(0, ...lanesUsed), maxLane: Math.max(0, ...lanesUsed), warnings: [...new Set(warnings)] };
 }
 
 // ---------- restart briefs ----------
@@ -351,6 +369,7 @@ const DEFAULT_RULES = [
 // opts.compact: shorter excerpts and only the last 3 route steps (used when many threads share one paste).
 export function makeBriefParts(map, laid, sessions, id, opts = {}) {
   const n = laid.by[id]; if (!n) throw new Error(`no node ${JSON.stringify(id)}`);
+  if (n.status === 'suggested') throw new Error(`node ${JSON.stringify(id)} is a suggestion, not a thread from the transcript: there is nothing to restart`);
   const compact = !!opts.compact;
   const t = turnFor(map, sessions, n.src);
   const s = parseSrc(n.src);
@@ -436,13 +455,21 @@ const wrapText = (t, w) => { const out = []; let line = ''; for (const word of S
 
 export function renderHtml(map, laid, sessions, verified, briefs, bundles = []) {
   const { nodes, by } = laid;
+  const loose = laid.loose || [];
   const SP = 250, ROW_H = 92, TOP = 78, LEFT = 120, RIGHT = 190;
   const X0 = LEFT + (-laid.minLane) * SP + 60;
   const W = Math.max(1100, X0 + laid.maxLane * SP + RIGHT);
-  const HEIGHT = TOP + (laid.rows - 1) * ROW_H + 90;
+  const TREE_H = TOP + (laid.rows - 1) * ROW_H + 90;
+  const perBand = Math.max(1, Math.floor((W - LEFT - RIGHT) / SP));
+  const BAND_H = loose.length ? 70 + Math.ceil(loose.length / perBand) * ROW_H : 0;
+  const HEIGHT = TREE_H + BAND_H;
   for (const n of nodes) { n.x = X0 + n.lane * SP; n.y = TOP + n.r * ROW_H; }
+  // directions that are not on the tree: their own band under it, no connecting lines
+  loose.forEach((n, i) => { n.x = LEFT + 60 + (i % perBand) * SP; n.y = TREE_H + 70 + Math.floor(i / perBand) * ROW_H; });
+  const allNodes = [...nodes, ...loose];
   const turnOf = (n) => turnFor(map, sessions, n.src);
-  const tsOf = (n) => { const t = turnOf(n); return t ? t.turn.ts : null; };
+  // a suggestion has no turn: it takes its day from the transcript node it extends
+  const tsOf = (n) => { let c = n; while (c && c.status === 'suggested') c = by[c.parent]; const t = c && turnOf(c); return t ? t.turn.ts : null; };
   const svg = [];
 
   // day bands
@@ -506,9 +533,14 @@ export function renderHtml(map, laid, sessions, verified, briefs, bundles = []) 
     events.push({ id: 'ev-' + e.id, after: a, kind: e.kind || 'note', title: e.title, quote: e.quote, who: t && t.role === 'H' ? 'You' : 'Claude', turn: e.src, when: t ? fmtTime(t.turn.ts) : '', ok: !!t && text.includes(norm(e.quote)) });
   }
 
+  if (loose.length) {
+    svg.push(`<line x1="0" y1="${TREE_H}" x2="${W}" y2="${TREE_H}" class="dayline"/>`);
+    svg.push(`<text x="${LEFT - 40}" y="${TREE_H + 32}" class="bandlab">Different directions: ideas from the literature that are not connected to anything in the conversation</text>`);
+  }
+
   // nodes
   const tips = {};
-  for (const n of nodes) {
+  for (const n of allNodes) {
     const big = !!n.route; const r = big ? 15 : 10; const st = n.status;
     const lines = wrapText(n.title, big ? 20 : 24).slice(0, 4);
     const lx = big ? n.x + 28 : n.x;
@@ -518,11 +550,14 @@ export function renderHtml(map, laid, sessions, verified, briefs, bundles = []) 
     const glyph = st === 'decided' ? `<path d="M${(n.x - r * .45).toFixed(1)} ${(n.y + r * .02).toFixed(1)} L${(n.x - r * .1).toFixed(1)} ${(n.y + r * .38).toFixed(1)} L${(n.x + r * .5).toFixed(1)} ${(n.y - r * .36).toFixed(1)}" class="gl"/>`
       : st === 'rejected' ? (() => { const k = r * .38; return `<path d="M${(n.x - k).toFixed(1)} ${(n.y - k).toFixed(1)} L${(n.x + k).toFixed(1)} ${(n.y + k).toFixed(1)} M${(n.x + k).toFixed(1)} ${(n.y - k).toFixed(1)} L${(n.x - k).toFixed(1)} ${(n.y + k).toFixed(1)}" class="gl"/>`; })()
       : st === 'deferred' ? (() => { const k = r * .3; return `<path d="M${(n.x - k).toFixed(1)} ${(n.y - r * .38).toFixed(1)} V${(n.y + r * .38).toFixed(1)} M${(n.x + k).toFixed(1)} ${(n.y - r * .38).toFixed(1)} V${(n.y + r * .38).toFixed(1)}" class="gl"/>`; })()
+      : st === 'suggested' ? (() => { const k = r * .42; return `<path d="M${(n.x - k).toFixed(1)} ${n.y.toFixed(1)} H${(n.x + k).toFixed(1)} M${n.x.toFixed(1)} ${(n.y - k).toFixed(1)} V${(n.y + k).toFixed(1)}" class="gl sg"/>`; })()
       : st === 'open' ? `<text x="${n.x}" y="${(n.y + r * .36).toFixed(1)}" class="qm" text-anchor="middle">?</text>`
       : st === 'now' ? `<circle cx="${n.x}" cy="${n.y}" r="${(r * .38).toFixed(1)}" class="gf"/>` : `<circle cx="${n.x}" cy="${n.y}" r="2" class="gf"/>`;
-    svg.push(`<g class="node st-${st}${big ? ' big' : ''}${ok ? '' : ' unver'}" data-id="${esc(n.id)}" data-st="${st}" tabindex="0" role="button" aria-label="${esc(n.title)}, ${LABEL[st]}">${ring}<circle cx="${n.x}" cy="${n.y}" r="${r}" class="dot${st === 'unexplored' ? ' unx' : ''}"/>${glyph}<text x="${lx}" y="${n.y + (big ? 26 : r + 17)}" class="lab${big ? ' labbig' : ''}" text-anchor="${big ? 'start' : 'middle'}">${lab}</text><circle cx="${n.x}" cy="${n.y}" r="${Math.max(r + 6, 20)}" class="hit"/></g>`);
+    svg.push(`<g class="node st-${st}${big ? ' big' : ''}${ok || st === 'suggested' ? '' : ' unver'}" data-id="${esc(n.id)}" data-st="${st}" tabindex="0" role="button" aria-label="${esc(n.title)}, ${LABEL[st]}">${ring}<circle cx="${n.x}" cy="${n.y}" r="${r}" class="dot${st === 'unexplored' ? ' unx' : st === 'suggested' ? ' sug' : ''}"/>${glyph}<text x="${lx}" y="${n.y + (big ? 26 : r + 17)}" class="lab${big ? ' labbig' : ''}" text-anchor="${big ? 'start' : 'middle'}">${lab}</text><circle cx="${n.x}" cy="${n.y}" r="${Math.max(r + 6, 20)}" class="hit"/></g>`);
     const t = turnOf(n);
-    tips[n.id] = { title: n.title, st, stl: LABEL[st], when: t ? fmtTime(t.turn.ts) : '', who: parseSrc(n.src).role === 'H' ? 'You' : 'Claude', quote: n.quote, note: n.note || '', ok: !!ok, turn: n.src, brief: RESTARTABLE.includes(st) && briefs[n.id] ? 1 : 0 };
+    tips[n.id] = st === 'suggested'
+      ? { title: n.title, st, stl: n.kind === 'direction' ? 'Suggested: new direction' : 'Suggested: new branch', when: '', note: n.note || '', sug: 1, ev: n.evidence.map((e) => ({ title: e.title, id: e.id || '', url: /^https?:\/\//i.test(e.url || '') ? e.url : '' })), brief: 0 }
+      : { title: n.title, st, stl: LABEL[st], when: t ? fmtTime(t.turn.ts) : '', who: parseSrc(n.src).role === 'H' ? 'You' : 'Claude', quote: n.quote, note: n.note || '', ok: !!ok, turn: n.src, brief: RESTARTABLE.includes(st) && briefs[n.id] ? 1 : 0 };
   }
   const evSeen = {};
   for (const e of events) {
@@ -532,16 +567,17 @@ export function renderHtml(map, laid, sessions, verified, briefs, bundles = []) 
     tips[e.id] = { title: e.title, st: 'event', stl: 'Event', when: e.when, who: e.who, quote: e.quote, note: '', ok: e.ok, turn: e.turn, brief: 0 };
   }
 
-  const cnt = Object.fromEntries(STATUSES.map((k) => [k, nodes.filter((n) => n.status === k).length]));
+  const cnt = Object.fromEntries(STATUSES.map((k) => [k, allNodes.filter((n) => n.status === k).length]));
   const root = nodes.find((n) => n.route && !n.parent);
   const now = nodes.find((n) => n.status === 'now') || [...nodes].filter((n) => n.route).sort((a, b) => b.idx - a.idx)[0];
   const allTurns = Object.values(sessions).flatMap((p) => p.turns);
   const days = new Set(allTurns.map((t) => dayKey(t.ts)));
   const prompts = allTurns.filter((t) => t.kind === 'prompt').length;
   const comps = Object.values(sessions).reduce((a, p) => a + p.compactions.length, 0);
-  const chips = ['decided', 'rejected', 'deferred', 'unexplored', 'open'].map((k) => `<button class="chip st-${k}" data-filter="${k}" aria-pressed="false"><i></i><b>${cnt[k]}</b> ${LABEL[k]}</button>`).join('');
+  const chips = ['decided', 'rejected', 'deferred', 'unexplored', 'open', ...(cnt.suggested ? ['suggested'] : [])].map((k) => `<button class="chip st-${k}" data-filter="${k}" aria-pressed="false"><i></i><b>${cnt[k]}</b> ${LABEL[k]}</button>`).join('');
   const openCount = nodes.filter((n) => OPEN_THREADS.includes(n.status)).length;
-  const verifiedCount = nodes.filter((n) => verified[n.id]).length;
+  const fromTranscript = allNodes.filter((n) => n.status !== 'suggested');
+  const verifiedCount = fromTranscript.filter((n) => verified[n.id]).length;
   const rootT = turnOf(root), nowT = turnOf(now);
   const css = CSS;
   return `<title>${esc(map.title)}</title>
@@ -556,13 +592,13 @@ export function renderHtml(map, laid, sessions, verified, briefs, bundles = []) 
       <svg class="arrow" viewBox="0 0 120 20" aria-hidden="true"><path d="M2 10 H108"/><path d="M108 4 L118 10 L108 16 Z"/></svg>
       <div class="end now"><span class="k">Now</span><b>${esc(now.title)}</b><span class="d">${esc(nowT ? fmtTime(nowT.turn.ts) : '')}</span></div>
     </div>
-    <div class="facts"><span><b>${days.size}</b> day${days.size === 1 ? '' : 's'}</span><span><b>${prompts}</b> of your prompts</span><span><b>${comps}</b> context compaction${comps === 1 ? '' : 's'}</span><span><b>${nodes.length}</b> choices mapped</span></div>
+    <div class="facts"><span><b>${days.size}</b> day${days.size === 1 ? '' : 's'}</span><span><b>${prompts}</b> of your prompts</span><span><b>${comps}</b> context compaction${comps === 1 ? '' : 's'}</span><span><b>${fromTranscript.length}</b> choices mapped</span></div>
   </header>
   <div class="legend" role="group" aria-label="Filter by status">${chips}<button class="chip clear" data-filter="" hidden>Show all</button>${openCount ? `<span class="copygroup">${(bundles.length > 1 ? bundles.map((b, i, all) => { const a = all.slice(0, i).reduce((x, y) => x + y.ids.length, 0) + 1; return `<button class="chip copyall" data-part="${i}"><b>Copy threads ${a}-${a + b.ids.length - 1} (part ${i + 1} of ${all.length})</b></button>`; }) : [`<button class="chip copyall" data-part="0"><b>Copy ${openCount} open thread${openCount === 1 ? '' : 's'} to restart</b></button>`]).join('')}</span>` : ''}</div>
   <div class="mapwrap" id="mapwrap"><svg id="map" viewBox="0 0 ${W} ${HEIGHT}" style="min-width:${Math.min(W, 900)}px" role="img" aria-label="Decision map of the conversation, newest at the bottom">
     ${svg.join('')}
   </svg></div>
-  <p class="foot">${esc(map.note || 'Built from the conversation transcript. Statuses are a judgement call by the model that read it.')} Every quote is checked against the transcript: <b>${verifiedCount} of ${nodes.length}</b> found${verifiedCount < nodes.length ? ' (the rest are drawn with a dashed outline)' : ''}. Times are in your local time zone. This page is private.</p>
+  <p class="foot">${esc(map.note || 'Built from the conversation transcript. Statuses are a judgement call by the model that read it.')} Every quote is checked against the transcript: <b>${verifiedCount} of ${fromTranscript.length}</b> found${verifiedCount < fromTranscript.length ? ' (the rest are drawn with a dashed outline)' : ''}.${cnt.suggested ? ` The ${cnt.suggested} dotted <b>Suggested</b> node${cnt.suggested === 1 ? '' : 's'} did not happen in the conversation: they come from papers, which are linked on each one.` : ''} Times are in your local time zone. This page is private.</p>
 </div>
 <div id="tip" role="tooltip" hidden></div>
 <script type="application/json" id="tips">${JSON.stringify(tips).replace(/</g, '\\u003c').replace(new RegExp('\\u2028', 'g'), '\\u2028').replace(new RegExp('\\u2029', 'g'), '\\u2029')}</script>
@@ -604,6 +640,7 @@ h4,p{margin:0}
 .chip:focus-visible,.node:focus-visible,.tipbtn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .st-decided{--c:var(--ok)}.st-rejected{--c:var(--bad)}.st-deferred{--c:var(--warn)}.st-unexplored{--c:var(--muted)}.st-open{--c:var(--open)}.st-now{--c:var(--accent)}
 .st-unexplored.chip i{background:transparent;border:2px dashed var(--muted)}
+.st-suggested.chip i{background:transparent;border:2px dotted var(--accent)}
 .mapwrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--bg)}
 #map{display:block;width:100%;height:auto}
 .band{fill:var(--bg)}.dayline{stroke:var(--line);stroke-width:1}
@@ -613,6 +650,7 @@ h4,p{margin:0}
 .edge.side{stroke:var(--c0,var(--muted));stroke-width:2.5;opacity:.75}
 .e-decided{--c0:var(--ok)}.e-rejected{--c0:var(--bad)}.e-deferred{--c0:var(--warn)}.e-open{--c0:var(--open)}
 .e-unexplored{--c0:var(--muted);stroke-dasharray:3 6}
+.e-suggested{--c0:var(--accent);stroke-dasharray:2 6}
 .ret{fill:none;stroke:var(--accent);stroke-width:2.5;stroke-dasharray:2 7;stroke-linecap:round}
 .rethead{fill:var(--accent)}
 .retlab{font:italic 12px var(--sans);fill:var(--accent)}
@@ -621,6 +659,13 @@ h4,p{margin:0}
 .node{cursor:pointer}
 .dot{fill:var(--c);stroke:var(--bg);stroke-width:3}
 .dot.unx{fill:var(--bg);stroke:var(--muted);stroke-width:2.25;stroke-dasharray:3 3}
+.dot.sug{fill:var(--bg);stroke:var(--accent);stroke-width:2.25;stroke-dasharray:2 3}
+.gl.sg{stroke:var(--accent)}
+.bandlab{font:600 12px var(--mono);fill:var(--accent);letter-spacing:.03em}
+.st-suggested .lab{fill:var(--accent)}
+#tip .evl{margin:0;padding-left:18px;font-size:13px;display:flex;flex-direction:column;gap:4px}
+#tip .evl a{color:var(--accent);overflow-wrap:anywhere}
+#tip.pinned{pointer-events:auto}
 .unver .dot{stroke:var(--warn);stroke-dasharray:3 2;stroke-width:2.5}
 .gl{fill:none;stroke:var(--glyph);stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
 .gf{fill:var(--glyph)}
@@ -679,9 +724,21 @@ const CLIENT_JS = `
     tip.innerHTML = ''; tip.className = 'st-' + t.st + (pin ? ' pinned' : '');
     var th = el('div', 'th'); th.appendChild(el('span', 'pill', t.stl)); th.appendChild(el('span', 'when', t.when)); tip.appendChild(th);
     tip.appendChild(el('h4', '', t.title));
-    var bq = el('blockquote', '', '\\u201c' + t.quote + '\\u201d');
-    bq.appendChild(el('cite', t.ok ? '' : 'bad', '\\u2014 ' + t.who + ', turn ' + t.turn + (t.ok ? ' \\u2713 found in transcript' : ' \\u26a0 not found verbatim')));
-    tip.appendChild(bq);
+    if (t.sug) {
+      tip.appendChild(el('p', 'note', 'Not from the conversation. Suggested from these papers:'));
+      var ul = el('ul', 'evl');
+      t.ev.forEach(function (e) {
+        var li = el('li', '');
+        if (e.url) { var a = el('a', '', e.title); a.href = e.url; a.target = '_blank'; a.rel = 'noopener noreferrer'; li.appendChild(a); } else li.appendChild(el('span', '', e.title));
+        if (e.id) li.appendChild(el('span', 'when', ' ' + e.id));
+        ul.appendChild(li);
+      });
+      tip.appendChild(ul);
+    } else {
+      var bq = el('blockquote', '', '\\u201c' + t.quote + '\\u201d');
+      bq.appendChild(el('cite', t.ok ? '' : 'bad', '\\u2014 ' + t.who + ', turn ' + t.turn + (t.ok ? ' \\u2713 found in transcript' : ' \\u26a0 not found verbatim')));
+      tip.appendChild(bq);
+    }
     if (t.note) tip.appendChild(el('p', 'note', t.note));
     if (pin && t.brief && briefs[id]) { var b = el('button', 'tipbtn', 'Copy restart brief'); b.addEventListener('click', function (ev) { ev.stopPropagation(); copyText(briefs[id], b, 'Copy restart brief'); }); tip.appendChild(b); }
     else if (!pin && t.brief) tip.appendChild(el('p', 'note', 'Click to pin, then copy a restart brief.'));
@@ -794,11 +851,12 @@ async function main(argv) {
   const keyed = await loadSessions(map, file);
   const laid = layout(map);
   const verified = verifyQuotes(map, keyed);
-  const bad = map.nodes.filter((n) => !verified[n.id]);
+  const fromTranscript = map.nodes.filter((n) => n.status !== 'suggested');
+  const bad = fromTranscript.filter((n) => !verified[n.id]);
   const report = () => {
     const cnt = Object.fromEntries(STATUSES.map((k) => [k, map.nodes.filter((n) => n.status === k).length]));
     console.log(`  ${map.nodes.length} nodes: ${STATUSES.map((k) => `${cnt[k]} ${LABEL[k].toLowerCase()}`).join(', ')}`);
-    console.log(`  quotes found in the transcript: ${map.nodes.length - bad.length} of ${map.nodes.length}`);
+    console.log(`  quotes found in the transcript: ${fromTranscript.length - bad.length} of ${fromTranscript.length}`);
     for (const n of bad) console.log(`  ! ${n.id} (${n.src}): quote not found verbatim: "${n.quote.slice(0, 80)}"`);
     for (const w of laid.warnings) console.log(`  ! layout: ${w}`);
   };
