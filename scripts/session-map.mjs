@@ -2,7 +2,7 @@
 // session-map: turn a long Claude Code conversation into a route map of its decisions.
 // No dependencies. Needs Node 18+.
 //
-//   node session-map.mjs digest <session-id|path|latest> [--out DIR] [--since-cursor MAP.json] [--chunk-kb 70] [--head 330] [--tail 220]
+//   node session-map.mjs digest <session-id|path|latest> [--out DIR] [--since-cursor MAP.json] [--chunk-kb 70] [--head 330] [--tail 220] [--with-tools]
 //   node session-map.mjs check  <map.json>
 //   node session-map.mjs build  <map.json>
 //   node session-map.mjs brief  <map.json> <id[,id...]|open> [--out DIR]
@@ -24,7 +24,7 @@ export const STATUSES = ['decided', 'rejected', 'deferred', 'unexplored', 'open'
 export const LABEL = { decided: 'Decided', rejected: 'Ruled out', deferred: 'Parked', unexplored: 'Never pursued', open: 'Open question', now: 'You are here', suggested: 'Suggested' };
 const RESTARTABLE = ['rejected', 'deferred', 'unexplored', 'open'];
 const OPEN_THREADS = ['deferred', 'unexplored', 'open'];
-const SRC_RE = /^(?:([A-Za-z0-9_-]+):)?([HA])(\d+)$/;
+const SRC_RE = /^(?:([A-Za-z0-9_-]+):)?([HA])(\d+)(?:\.t(\d+))?$/;
 const ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
 export const norm = (t) => String(t).replace(/\s+/g, ' ').trim().normalize('NFC');
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -69,6 +69,45 @@ export function humanText(d) {
   if (!t || t.startsWith('<') || t.startsWith('[Request interrupted') || t.startsWith('Caveat:')) return null;
   return t;
 }
+// ---------- tool calls (opt-in: digest --with-tools) ----------
+
+/** Scrubs what a tool line must never carry into a digest or a published map: keys, tokens, emails, phone numbers, credentials in URLs. */
+export function redact(t) {
+  return String(t)
+    .replace(/:\/\/[^\s/@:]+:[^\s/@]+@/g, '://[redacted]@')
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\/=-]{6,}/gi, 'Bearer [redacted]')
+    .replace(/(\b[\w-]*(?:key|token|secret|passw(?:or)?d|authorization|credential)[\w-]*\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s"',;&]+)/gi, '$1[redacted]')
+    .replace(/\b(?:sk|pk|rk|ghp|gho|ghs|xox[abp]|AKIA|eyJ)[A-Za-z0-9_.\-]{10,}/g, '[redacted]')
+    .replace(/[A-Za-z0-9+\/]{32,}/g, (m) => (/\d/.test(m) && /[a-z]/.test(m) && /[A-Z]/.test(m) ? '[redacted]' : m)) // mixed-case opaque runs; slugs, paths, uuids and hex ids are not keys
+    .replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, '[email]')
+    .replace(/\+\d[\d\s().-]{7,}\d/g, '[phone]')
+    .replace(/\(?\b\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b/g, '[phone]');
+}
+const clipTo = (t, n) => (t.length > n ? t.slice(0, n - 1) + '…' : t);
+
+/** One line per tool call: what it was asked to do, never its output and never the content of a file it wrote. */
+export function summarizeTool(name, input) {
+  const i = input && typeof input === 'object' ? input : {};
+  let t;
+  if (name === 'Bash') t = i.command || i.description;
+  else if (name === 'Write') t = `${i.file_path || ''} (${Buffer.byteLength(String(i.content || ''))} bytes written)`;
+  else if (['Read', 'Edit', 'NotebookEdit', 'MultiEdit'].includes(name)) t = i.file_path || i.notebook_path;
+  else if (name === 'Grep') t = `${i.pattern || ''}${i.path ? ' in ' + i.path : ''}`;
+  else if (name === 'Glob') t = i.pattern;
+  else if (name === 'WebSearch') t = i.query;
+  else if (name === 'WebFetch') t = i.url;
+  else if (name === 'Agent' || name === 'Task') t = i.description;
+  else if (name === 'SendMessage') t = `to ${i.to || '?'}: ${i.summary || ''}`;
+  else {
+    const vals = Object.entries(i).filter(([, v]) => typeof v === 'string' && v).map(([k, v]) => `${k}=${clipTo(v.replace(/\s+/g, ' '), 60)}`);
+    t = vals.join(' ');
+  }
+  return clipTo(norm(redact(t || '')), 200);
+}
+/** The text a quote citing "A12.t5" is checked against, and the line the digest shows for it. */
+export const toolLine = (c) => `${c.name}: ${c.text}${c.err ? ` -> ERROR: ${c.err}` : ''}`;
+const resultText = (c) => (typeof c === 'string' ? c : Array.isArray(c) ? c.map((b) => (b && b.text) || '').join(' ') : '');
+
 const SUMMARY_RE = /^This session is being continued from a previous conversation/;
 const LIMIT_RE = /You've hit your (?:[a-z0-9-]+ )?(?:spend )?limit|You've hit your (?:weekly|monthly|daily|5-hour|session|usage) (?:spend )?limit/i;
 
@@ -84,12 +123,22 @@ export async function parseTranscript(file) {
     if (d && d.compactMetadata) { compactions.push({ after: turns.length, ts: d.timestamp || null }); continue; }
     const h = humanText(d);
     if (h !== null) {
-      cur = { n: turns.length + 1, ts: d.timestamp || null, human: norm(h), assistant: '', kind: SUMMARY_RE.test(h) ? 'summary' : 'prompt' };
+      cur = { n: turns.length + 1, ts: d.timestamp || null, human: norm(h), assistant: '', kind: SUMMARY_RE.test(h) ? 'summary' : 'prompt', tools: [], events: [] };
       turns.push(cur); continue;
+    }
+    if (cur && d && d.type === 'user' && !d.isSidechain && d.message && Array.isArray(d.message.content)) {
+      for (const b of d.message.content) {
+        if (!b || b.type !== 'tool_result' || !b.is_error) continue; // only failures are kept: they are what kills an option
+        const call = cur.tools.find((x) => x.id === b.tool_use_id);
+        if (call) call.err = clipTo(norm(redact(resultText(b.content))), 200);
+      }
     }
     if (cur && d && d.type === 'assistant' && !d.isSidechain) {
       const c = d.message && d.message.content;
-      if (Array.isArray(c)) for (const b of c) if (b && b.type === 'text' && b.text) cur.assistant += ' ' + b.text;
+      if (Array.isArray(c)) for (const b of c) {
+        if (b && b.type === 'text' && b.text) { cur.assistant += ' ' + b.text; cur.events.push({ text: b.text }); }
+        else if (b && b.type === 'tool_use') { const call = { id: b.id, name: b.name || 'tool', text: summarizeTool(b.name, b.input), err: null }; cur.tools.push(call); cur.events.push({ tool: cur.tools.length }); }
+      }
     }
   }
   for (const t of turns) t.assistant = norm(t.assistant);
@@ -102,7 +151,7 @@ const dayKey = (ts) => ts ? new Date(ts).toLocaleDateString('en-US', { month: 's
 
 // ---------- digest ----------
 
-export function digestChunks(parsed, { head = 330, tail = 220, promptMax = 700, from = 1, chunkKb = 70 } = {}) {
+export function digestChunks(parsed, { head = 330, tail = 220, promptMax = 700, from = 1, chunkKb = 70, withTools = false } = {}) {
   const trim = (t, h, tl) => (t.length > h + tl + 40 ? `${t.slice(0, h)} [...] ${t.slice(-tl)}` : t);
   const blocks = [];
   for (const t of parsed.turns) {
@@ -110,7 +159,17 @@ export function digestChunks(parsed, { head = 330, tail = 220, promptMax = 700, 
     const comp = parsed.compactions.filter((c) => c.after === t.n - 1 && t.n > 1);
     for (const c of comp) blocks.push(`\n==== COMPACTION after H${t.n - 1}${c.ts ? ' at ' + fmtTime(c.ts) : ''} ====`);
     const human = t.human.length > promptMax ? `${t.human.slice(0, promptMax - 180)} [...long or pasted, trimmed...] ${t.human.slice(-150)}` : t.human;
-    blocks.push(`\n#### H${t.n} ${fmtTime(t.ts)}${t.kind === 'summary' ? ' [compaction summary, written by Claude]' : ''}\n${human}` + (t.assistant ? `\n  [A${t.n}] ${trim(t.assistant, head, tail)}` : ''));
+    let reply = t.assistant ? `\n  [A${t.n}] ${trim(t.assistant, head, tail)}` : '';
+    if (withTools && t.tools && t.tools.length) { // prose and tool calls in the order they happened; each call has its own id (A12.t5)
+      const lines = []; let run = '';
+      const flush = () => { if (norm(run)) lines.push(`  [A${t.n}] ${trim(norm(run), head, tail)}`); run = ''; };
+      for (const e of t.events) {
+        if (e.text) run += ' ' + e.text;
+        else { flush(); lines.push(`  [A${t.n}.t${e.tool}] ${toolLine(t.tools[e.tool - 1])}`); }
+      }
+      flush(); reply = '\n' + lines.join('\n');
+    }
+    blocks.push(`\n#### H${t.n} ${fmtTime(t.ts)}${t.kind === 'summary' ? ' [compaction summary, written by Claude]' : ''}\n${human}` + reply);
   }
   const chunks = []; let cur = '';
   for (const b of blocks) {
@@ -125,7 +184,8 @@ export function digestChunks(parsed, { head = 330, tail = 220, promptMax = 700, 
 
 export function parseSrc(src) {
   const m = SRC_RE.exec(String(src || ''));
-  return m ? { sid: m[1] || null, role: m[2], n: Number(m[3]) } : null;
+  if (!m || (m[4] && m[2] !== 'A')) return null; // only Claude's turns have tool calls
+  return { sid: m[1] || null, role: m[2], n: Number(m[3]), ...(m[4] ? { tool: Number(m[4]) } : {}) };
 }
 
 export function validate(map) {
@@ -156,7 +216,7 @@ export function validate(map) {
     } else {
       if (typeof n.quote !== 'string' || !n.quote.trim()) errs.push(`${at}: quote is required (a verbatim quote from the cited turn)`);
       const s = parseSrc(n.src);
-      if (!s) errs.push(`${at}: src must look like H12 or A12 (or sessionid:H12 when there are several sessions)`);
+      if (!s) errs.push(`${at}: src must look like H12 or A12, or A12.t5 for the 5th tool call of that reply (add sessionid: when there are several sessions)`);
       else if (multi && !s.sid) errs.push(`${at}: src needs a session prefix (sessionid:${n.src}) because the map has several sessions`);
     }
     if (n.route && !n.parent) roots++;
@@ -183,7 +243,13 @@ function turnFor(map, sessions, srcStr) {
   const sid = s.sid ? Object.keys(sessions).find((k) => k.startsWith(s.sid) || s.sid.startsWith(k)) : Object.keys(sessions)[0];
   const p = sid && sessions[sid]; if (!p) return null;
   const turn = p.turns[s.n - 1];
-  return turn ? { sid, turn, role: s.role, n: s.n } : null;
+  return turn ? { sid, turn, role: s.role, n: s.n, tool: s.tool } : null;
+}
+/** The text of the cited turn, or of the cited tool call, that a quote must appear in. */
+function citedText(t) {
+  if (!t) return '';
+  if (t.tool) { const c = t.turn.tools && t.turn.tools[t.tool - 1]; return c ? toolLine(c) : ''; }
+  return t.role === 'H' ? t.turn.human : t.turn.assistant;
 }
 
 export function verifyQuotes(map, sessions) {
@@ -191,7 +257,7 @@ export function verifyQuotes(map, sessions) {
   for (const n of map.nodes) {
     if (n.status === 'suggested') continue; // nothing to check: it is not a claim about the transcript
     const t = turnFor(map, sessions, n.src);
-    const text = t ? (t.role === 'H' ? t.turn.human : t.turn.assistant) : '';
+    const text = citedText(t);
     out[n.id] = !!t && norm(n.quote).length > 0 && text.includes(norm(n.quote));
   }
   return out;
@@ -207,7 +273,7 @@ const orderKey = (map, n, depth = 0) => {
   }
   const s = parseSrc(n.src) || { sid: null, n: 0, role: 'H' };
   const si = Math.max(0, map.sessions.findIndex((x) => s.sid && (x.id.startsWith(s.sid) || s.sid.startsWith(x.id))));
-  return [si, s.n, s.role === 'H' ? 0 : 1];
+  return [si, s.n, s.role === 'H' ? 0 : 1 + (s.tool || 0) / 10000];
 };
 
 /**
@@ -373,7 +439,7 @@ export function makeBriefParts(map, laid, sessions, id, opts = {}) {
   const compact = !!opts.compact;
   const t = turnFor(map, sessions, n.src);
   const s = parseSrc(n.src);
-  const who = s.role === 'H' ? 'You said' : 'Claude said';
+  const who = s.role === 'H' ? 'You said' : s.tool ? 'Claude ran' : 'Claude said';
   const ref = (sid, role, num) => (map.sessions.length > 1 ? `${sid.slice(0, 8)}:` : '') + role + num;
   const clip = (x, max) => (x.length > max ? x.slice(0, max).trimEnd() + '...' : x);
   const around = (text, quote, w) => {
@@ -386,7 +452,8 @@ export function makeBriefParts(map, laid, sessions, id, opts = {}) {
   if (t) {
     const p = sessions[t.sid], turn = t.turn;
     if (s.role === 'A') {
-      ex.push(`- Claude (${ref(t.sid, 'A', t.n)}): "${around(turn.assistant, n.quote, compact ? 240 : 330)}"`);
+      if (s.tool) ex.push(`- Tool call (${ref(t.sid, 'A', t.n)}.t${s.tool}): "${clip(citedText(t), compact ? 240 : 330)}"`);
+      else ex.push(`- Claude (${ref(t.sid, 'A', t.n)}): "${around(turn.assistant, n.quote, compact ? 240 : 330)}"`);
       const next = p.turns[t.n];
       if (next && next.kind !== 'summary') ex.push(`- You, next (${ref(t.sid, 'H', t.n + 1)}): "${clip(next.human, compact ? 320 : 450)}"`);
     } else {
@@ -529,7 +596,7 @@ export function renderHtml(map, laid, sessions, verified, briefs, bundles = []) 
   for (const e of map.events || []) {
     const a = by[e.after]; if (!a) continue;
     const t = turnFor(map, sessions, e.src);
-    const text = t ? (t.role === 'H' ? t.turn.human : t.turn.assistant) : '';
+    const text = citedText(t);
     events.push({ id: 'ev-' + e.id, after: a, kind: e.kind || 'note', title: e.title, quote: e.quote, who: t && t.role === 'H' ? 'You' : 'Claude', turn: e.src, when: t ? fmtTime(t.turn.ts) : '', ok: !!t && text.includes(norm(e.quote)) });
   }
 
@@ -822,6 +889,7 @@ async function main(argv) {
   }
   if (cmd === 'digest') {
     const out = flag(rest, '--out', path.join(process.cwd(), 'session-map-digest'));
+    const withTools = rest.includes('--with-tools'); if (withTools) rest.splice(rest.indexOf('--with-tools'), 1);
     const sinceMap = flag(rest, '--since-cursor');
     const chunkKb = Number(flag(rest, '--chunk-kb', 70)), head = Number(flag(rest, '--head', 330)), tail = Number(flag(rest, '--tail', 220));
     let ref = rest[0], from = 1, map = null, key = null;
@@ -835,12 +903,12 @@ async function main(argv) {
       key = sess.id; from = ((map.cursor || {})[key] || 0) + 1;
     }
     const parsed = await parseTranscript(file);
-    const chunks = digestChunks(parsed, { head, tail, from, chunkKb });
+    const chunks = digestChunks(parsed, { head, tail, from, chunkKb, withTools });
     fs.mkdirSync(out, { recursive: true });
     for (const f of fs.readdirSync(out)) if (/^digest-\d+\.txt$/.test(f)) fs.rmSync(path.join(out, f));
     chunks.forEach((c, i) => fs.writeFileSync(path.join(out, `digest-${String(i + 1).padStart(3, '0')}.txt`), c.trimStart() + '\n'));
     const prompts = parsed.turns.filter((t) => t.kind === 'prompt').length;
-    console.log(`session ${path.basename(file)}\n  ${parsed.turns.length} turns (${prompts} prompts), ${parsed.compactions.length} compaction(s), ${fmtTime(parsed.turns[0].ts)} to ${fmtTime(parsed.turns.at(-1).ts)}\n  digest from H${from}: ${chunks.length} chunk(s) in ${out}${chunks.length ? '' : ' (nothing new since the last build)'}`);
+    console.log(`session ${path.basename(file)}\n  ${parsed.turns.length} turns (${prompts} prompts), ${parsed.turns.reduce((a, x) => a + x.tools.length, 0)} tool call(s)${withTools ? ' included' : ' (not in the digest; add --with-tools)'}, ${parsed.compactions.length} compaction(s), ${fmtTime(parsed.turns[0].ts)} to ${fmtTime(parsed.turns.at(-1).ts)}\n  digest from H${from}: ${chunks.length} chunk(s) in ${out}${chunks.length ? '' : ' (nothing new since the last build)'}`);
     chunks.forEach((c, i) => console.log(`    digest-${String(i + 1).padStart(3, '0')}.txt  ${(Buffer.byteLength(c) / 1024).toFixed(0)} KB`));
     if (map && key) { map.pending = { ...(map.pending || {}), [key]: parsed.turns.length }; writeMap(sinceMap, map); }
     return 0;

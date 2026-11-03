@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { validate, parseSrc, parseTranscript, digestChunks, verifyQuotes, layout, makeBrief, renderHtml, findSession } from './session-map.mjs';
+import { validate, parseSrc, parseTranscript, digestChunks, verifyQuotes, layout, makeBrief, renderHtml, findSession, toolLine } from './session-map.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(here, 'session-map.mjs');
@@ -201,7 +201,7 @@ test('CLI: check fails on a bad quote, build writes map.html and advances the cu
   assert.equal(JSON.parse(fs.readFileSync(mapFile, 'utf8')).cursor['example-session'], 11);
   const out = path.join(dir, 'briefs');
   assert.match(run('brief', mapFile, 'open', '--out', out), /brief-redis\.md/);
-  assert.deepEqual(fs.readdirSync(out).sort(), ['brief-provider.md', 'brief-redis.md', 'brief-region.md', 'brief-sms.md']);
+  assert.deepEqual(fs.readdirSync(out).sort(), ['brief-provider.md', 'brief-redis.md', 'brief-region.md', 'brief-sms.md', 'restart-part-1.md']);
   map.nodes[2].quote = 'invented'; fs.writeFileSync(mapFile, JSON.stringify(map));
   assert.throws(() => run('check', mapFile), (e) => e.status === 1 && /not found verbatim/.test(e.stdout));
 });
@@ -218,4 +218,82 @@ test('CLI: digest --since-cursor prints only new turns and records what it cover
   const d = fs.readFileSync(path.join(out, 'digest-001.txt'), 'utf8');
   assert.ok(d.includes('#### H10') && !d.includes('#### H9'));
   assert.equal(JSON.parse(fs.readFileSync(mapFile, 'utf8')).pending['example-session'], 11);
+});
+
+// ---------- tool calls (digest --with-tools) ----------
+
+function toolSession() {
+  const dir = tmp('sm-tools-'), f = path.join(dir, 'tools-session.jsonl');
+  const L = (o) => JSON.stringify(o);
+  fs.writeFileSync(f, [
+    L({ type: 'user', timestamp: '2026-11-01T10:00:00Z', message: { role: 'user', content: 'ship the fix' } }),
+    L({ type: 'assistant', timestamp: '2026-11-01T10:00:05Z', message: { role: 'assistant', content: [
+      { type: 'text', text: 'Starting with the build.' },
+      { type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: "curl -H 'Authorization: " + ['Bear', 'er abc123def456ghi789jkl'].join('') + "' https://x.test && echo " + ['sk', '-live1234567890abcdefgh'].join('') } },
+    ] } }),
+    L({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu1', is_error: true, content: 'Exit code 22: mail jane@example.com or call +1 415 555 0100' }] } }),
+    L({ type: 'assistant', timestamp: '2026-11-01T10:00:09Z', message: { role: 'assistant', content: [
+      { type: 'text', text: 'That failed, so I will write the config instead.' },
+      { type: 'tool_use', id: 'tu2', name: 'Write', input: { file_path: '/tmp/app.env', content: 'API_KEY=supersecretvalue123456' } },
+      { type: 'tool_use', id: 'tu3', name: 'Read', input: { file_path: '/tmp/ok.txt' } },
+    ] } }),
+    L({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu3', content: 'a long successful output that must never appear' }] } }),
+  ].join('\n') + '\n');
+  return f;
+}
+
+test('parseSrc reads a tool-call id, only on Claude turns', () => {
+  assert.deepEqual(parseSrc('A3.t2'), { sid: null, role: 'A', n: 3, tool: 2 });
+  assert.deepEqual(parseSrc('abc:A3.t12'), { sid: 'abc', role: 'A', n: 3, tool: 12 });
+  assert.equal(parseSrc('H3.t2'), null);
+  assert.deepEqual(parseSrc('A3'), { sid: null, role: 'A', n: 3 });
+});
+
+test('tool calls are kept per turn: inputs only, failures with their error, nothing from successful output or written files, secrets redacted', async () => {
+  const p = await parseTranscript(toolSession());
+  assert.equal(p.turns.length, 1);
+  const [bash, write, read] = p.turns[0].tools;
+  assert.ok(bash.err && /Exit code 22/.test(bash.err));
+  assert.ok(!/abc123def456|sk-live|jane@example|555 0100/.test(toolLine(bash)), toolLine(bash));
+  assert.match(write.text, /\/tmp\/app\.env \(\d+ bytes written\)/);
+  assert.ok(!/supersecret/.test(toolLine(write)));
+  assert.equal(read.err, null);
+  assert.ok(!/long successful output/.test(JSON.stringify(p.turns[0].tools)));
+});
+
+test('digest lists tool calls in order with their own ids only when asked', async () => {
+  const p = await parseTranscript(toolSession());
+  const off = digestChunks(p).join('');
+  assert.ok(!/\[A1\.t1\]/.test(off));
+  const on = digestChunks(p, { withTools: true }).join('');
+  assert.ok(on.indexOf('[A1.t1]') > on.indexOf('Starting with the build.') && on.indexOf('[A1.t1]') < on.indexOf('[A1.t2]'));
+  assert.ok(on.indexOf('That failed') > on.indexOf('[A1.t1]') && on.indexOf('That failed') < on.indexOf('[A1.t2]'));
+  assert.match(on, /\[A1\.t1\] Bash: .*-> ERROR: Exit code 22/);
+  assert.ok(!/abc123def456|supersecret|jane@example/.test(on));
+});
+
+test('a quote citing a tool call is checked against that call, not the prose', async () => {
+  const p = await parseTranscript(toolSession());
+  const sessions = { s: p };
+  const map = M([N('a', { route: true, src: 'A1.t3', quote: 'Read: /tmp/ok.txt' }), N('b', { parent: 'a', src: 'A1.t1', quote: '-> ERROR: Exit code 22' }),
+    N('c', { parent: 'a', src: 'A1.t2', quote: 'supersecretvalue' }), N('d', { parent: 'a', src: 'A1.t9', quote: 'Read' }), N('e', { parent: 'a', src: 'A1', quote: 'That failed, so I will write the config instead.' })]);
+  assert.deepEqual(verifyQuotes(map, sessions), { a: true, b: true, c: false, d: false, e: true });
+});
+
+test('CLI: digest --with-tools writes the tool lines and reports the count', () => {
+  const f = toolSession(), out = tmp('sm-tools-out-');
+  const on = execFileSync('node', [SCRIPT, 'digest', f, '--out', out, '--with-tools'], { encoding: 'utf8' });
+  assert.match(on, /3 tool call\(s\) included/);
+  assert.match(fs.readFileSync(path.join(out, 'digest-001.txt'), 'utf8'), /\[A1\.t3\] Read: \/tmp\/ok\.txt/);
+  const off = execFileSync('node', [SCRIPT, 'digest', f, '--out', out], { encoding: 'utf8' });
+  assert.match(off, /not in the digest; add --with-tools/);
+  assert.ok(!/\[A1\.t3\]/.test(fs.readFileSync(path.join(out, 'digest-001.txt'), 'utf8')));
+});
+
+test('redaction hides keys but leaves file names, paths and ids readable', async () => {
+  const { redact } = await import('./session-map.mjs');
+  const keep = 'cat ~/.claude/projects/-Users-sushanth/memory/project_markets_harness_2026_11_01.md --sid 56756f27-902d-4f61-af54-a4dabb6b3e59 /private/tmp/claude-501/scratchpad/session-map';
+  assert.equal(redact(keep), keep);
+  for (const bad of ['Zm9vYmFyQmF6UXV4MTIzNDU2Nzg5MFhZWmFiY2RlZg', 'api_key=hunter2hunter2', 'sk-ant-api03-AbCdEf123456', 'postgres://u:pw@host/db', 'a@b.co', '+1 415 555 0100'])
+    assert.notEqual(redact(`x ${bad} y`), `x ${bad} y`, bad);
 });

@@ -32,7 +32,7 @@ One folder per session, outside any repo: the session scratchpad directory if th
 
 ## Building a map
 
-1. **Digest the session.** `node <script> digest <session> --out <folder>/digest`. It prints how many turns, prompts and compactions there are and lists the chunk files. Turns are numbered: `H12` is the 12th message from the user, `A12` is Claude's reply to it. Long pasted prompts and long replies are trimmed in the digest.
+1. **Digest the session.** `node <script> digest <session> --out <folder>/digest`. It prints how many turns, prompts and compactions there are and lists the chunk files. Turns are numbered: `H12` is the 12th message from the user, `A12` is Claude's reply to it. Long pasted prompts and long replies are trimmed in the digest. For a session where the user sent few prompts and Claude did most of the work in tool calls, add `--with-tools`: the digest then lists each tool call in order between the prose, as `[A12.t5] Bash: <command, redacted and shortened>`, and adds ` -> ERROR: ...` when the call failed. Cite one with `src: "A12.t5"`; its quote is checked against that line. Without the flag the digest is unchanged and the output says how many tool calls it left out.
 
 2. **Read every chunk, in order.** Use the Read tool on each `digest-NNN.txt`. Do not sample. The point of the map is the things that are easy to miss. Note, as you read: directions chosen, options rejected and why, anything put off, options offered that nobody picked, questions left hanging, standing rules that came up, and moments where an earlier thread was finally picked up.
 
@@ -77,7 +77,7 @@ The page has two ways to do this by hand: click a node and choose **Copy restart
 
 ## What this does not do
 
-- It does not read tool output, file contents or subagent transcripts, only the conversation between the user and Claude.
+- It does not read subagent transcripts, file contents or successful tool output. By default it reads only the conversation between the user and Claude; with `digest --with-tools` it also reads what each tool call was asked to do (never the content of a file it wrote) and the error text of failed calls, with keys, tokens, emails, phone numbers and URL credentials redacted. Redaction is pattern-based, so look over the digest before publishing a map built from it.
 - It cannot start work inside the original session. Copy a brief into that session, or use `resume` from this one.
 - The transcript format is internal to Claude Code and can change between versions. If the digest finds no conversation, the script says so instead of guessing.
 - A map of a conversation is a reading of it. Treat statuses as a starting point to correct, and the quotes as the part you can trust.
