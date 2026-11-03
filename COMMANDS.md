@@ -57,6 +57,7 @@ Use this when you have a specific requirement to implement.
 | `/wayread:session-map` | Reads a long Claude Code conversation and draws a route map of its decisions: green for decided, red for ruled out, amber for parked, a dotted ring for options nobody picked up, purple for open questions. Every node has a quote that is checked against the transcript. `update` adds what happened since; `resume` restarts the missed threads in parallel, after you confirm. The page can also copy a restart brief for any thread. Needs Node 18+. |
 | `/wayread:session-log-catchup` | Writes the close-out summaries for Claude Code sessions that ended without one — three short paragraphs (where we started, where we ended, what is left) per pending session, committed to the product repo's `docs/session-log/` or the cross-project `session-logs` folder. Runs on its own after a session starts (once a `SessionStart` hook is configured in your personal settings), or by hand. Needs Node 18+. |
 | `/wayread:unpushed-work` | Finds git work that exists only on this machine — branches ahead of their remote, stash entries, commits orphaned by a reset or a dropped stash — in one repo or swept across every repo under a folder. Never pushes anything itself; reports and asks. `catch-up`, `ship-check`, `fix-repo-cycle`, `new-feature-cycle` and `refactor-cycle` already run a quick version of it at the end of their own flow. Needs Node 18+. |
+| `/wayread:worktrees` | Maps every git worktree to the Claude session that made it, compares what it holds against production (GitHub PR state, Fly release time, Android tags) and decides per worktree: drop it, push it and open a PR to take it to production, or keep it. Read-only, prints the commands and runs none; Repos listed in a policy file are held and never suggested for production. Needs Node 18+; the script lives in the wayread checkout. |
 | `/wayread:runbook` | The entry point when you're not sure which command fits — maps an intent (new feature, fix bugs, orient, ship-readiness, refactor, catch up) to the right command, and can run it for you after confirming. |
 
 ## Periodic diagnostics (no fixed sequence — run standalone, any time)
@@ -79,6 +80,7 @@ Not tied to a specific change or release moment — these answer "is this system
 - **"Let me watch what this change is doing."** → `/wayread:live-plan "X"`
 - **"Where did this long conversation go, and what did we drop?"** → `/wayread:session-map latest`
 - **"Did I push everything? What's stuck on this laptop?"** → `/wayread:unpushed-work` (or `sweep <root>` for every repo)
+- **"Which worktrees can go, and which should I ship?"** → `/wayread:worktrees`
 - **"Give me everything on this diff, once."** → `/wayread:change-full-review`
 - **"I just want to understand this codebase, not change it."** → `/wayread:orient`
 - **"Can this ship?"** → `/wayread:ship-check`
